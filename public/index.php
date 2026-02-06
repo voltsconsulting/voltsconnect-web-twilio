@@ -1482,6 +1482,7 @@ if ($uri === '/app' && $method === 'GET') {
     $content .= '<a class="navItem active" href="#inbox" id="navInbox">Inbox</a>';
     $content .= '<a class="navItem" href="#dialpad" id="navDialpad">Dial Pad</a>';
     $content .= '<a class="navItem" href="#calls" id="navCalls">Calls</a>';
+    $content .= '<a class="navItem" href="#voicemails" id="navVoicemails">Voicemails</a>';
     $content .= '<a class="navItem" href="#contacts" id="navContacts">Contacts</a>';
     $content .= '<a class="navItem" href="#numbers" id="navNumbers">Numbers</a>';
     $content .= '<a class="navItem" href="#settings" id="navSettings">Settings</a>';
@@ -1603,6 +1604,18 @@ if ($uri === '/app' && $method === 'GET') {
     $content .= '</div>';
     $content .= '<div style="height:12px"></div>';
     $content .= '<div class="list" id="callsList"></div>';
+    $content .= '</div>';
+    $content .= '</section>';
+
+    $content .= '<section class="view" id="viewVoicemails" style="display:none">';
+    $content .= '<div class="pageHeader"><div class="pageTitle">Voicemails</div><div class="small">Admin: voicemail recordings</div></div>';
+    $content .= '<div class="card">';
+    $content .= '<div class="row" style="align-items:center;justify-content:space-between">';
+    $content .= '<div class="small">Latest voicemails</div>';
+    $content .= '<button class="btn" type="button" id="refreshVoicemailsMain">Refresh</button>';
+    $content .= '</div>';
+    $content .= '<div style="height:12px"></div>';
+    $content .= '<div class="list" id="voicemailsListMain"></div>';
     $content .= '</div>';
     $content .= '</section>';
 
@@ -2252,7 +2265,22 @@ if ($uri === '/api/admin/voicemails' && $method === 'GET') {
         ORDER BY created_at DESC
         LIMIT ' . $limit);
     $stmt->execute();
-    json(['voicemails' => $stmt->fetchAll()]);
+    $rows = $stmt->fetchAll();
+    $out = [];
+    if (is_array($rows)) {
+        foreach ($rows as $r) {
+            $row = is_array($r) ? $r : [];
+            $url = trim((string) (($row['recording_url'] ?? '') ?: ''));
+            $sid = '';
+            if ($url !== '' && preg_match('/\/Recordings\/(RE[a-zA-Z0-9]+)/', $url, $m)) {
+                $sid = (string) ($m[1] ?? '');
+            }
+            $row['recording_sid'] = $sid !== '' ? $sid : null;
+            $row['recording_proxy_url'] = $sid !== '' ? ('/api/voice/recording?sid=' . rawurlencode($sid)) : null;
+            $out[] = $row;
+        }
+    }
+    json(['voicemails' => $out]);
 }
 
 if ($uri === '/api/admin/numbers/assign' && $method === 'POST') {

@@ -188,13 +188,16 @@ function wireTwilioAccountsSettings() {
 
 function renderVoicemails() {
   const list = el('voicemailsList');
+  const listMain = el('voicemailsListMain');
   if (!list) return;
   const items = Array.isArray(state.voicemails) ? state.voicemails : [];
   if (items.length === 0) {
     list.innerHTML = '<div class="item"><div class="small">No voicemails yet</div></div>';
+    if (listMain) listMain.innerHTML = '<div class="item"><div class="small">No voicemails yet</div></div>';
     return;
   }
-  list.innerHTML = items.map((v) => {
+
+  const html = items.map((v) => {
     const when = escapeHtml(fmtWhen(v.created_at || ''));
     const from = escapeHtml(v.from_number || '');
     const to = escapeHtml(v.to_number || '');
@@ -205,7 +208,7 @@ function renderVoicemails() {
       const m = url.match(/\/Recordings\/(RE[a-zA-Z0-9]+)/);
       if (m && m[1]) sid = String(m[1]);
     }
-    const proxied = sid ? `/api/voice/recording?sid=${encodeURIComponent(sid)}` : '';
+    const proxied = String(v.recording_proxy_url || '').trim() || (sid ? `/api/voice/recording?sid=${encodeURIComponent(sid)}` : '');
     const link = proxied ? `<a class="btn" href="${escapeHtml(proxied)}" target="_blank">Open</a>` : '';
     return `<div class="item">
       <div class="row" style="align-items:center;justify-content:space-between">
@@ -219,17 +222,23 @@ function renderVoicemails() {
       </div>
     </div>`;
   }).join('');
+
+  list.innerHTML = html;
+  if (listMain) listMain.innerHTML = html;
 }
 
 async function loadVoicemails() {
   const list = el('voicemailsList');
+  const listMain = el('voicemailsListMain');
   if (list) list.innerHTML = '<div class="item"><div class="small">Loading...</div></div>';
+  if (listMain) listMain.innerHTML = '<div class="item"><div class="small">Loading...</div></div>';
   try {
     const data = await apiGet('/api/admin/voicemails?limit=50');
     state.voicemails = data.voicemails || [];
   } catch (e) {
     state.voicemails = [];
     if (list) list.innerHTML = `<div class="item"><div class="small">${escapeHtml(e && e.message ? e.message : String(e))}</div></div>`;
+    if (listMain) listMain.innerHTML = `<div class="item"><div class="small">${escapeHtml(e && e.message ? e.message : String(e))}</div></div>`;
     return;
   }
   renderVoicemails();
@@ -280,6 +289,9 @@ function wireVoiceRoutingSettings() {
 function wireVoicemails() {
   const refresh = el('refreshVoicemails');
   if (refresh) refresh.addEventListener('click', () => loadVoicemails().catch(() => {}));
+
+  const refreshMain = el('refreshVoicemailsMain');
+  if (refreshMain) refreshMain.addEventListener('click', () => loadVoicemails().catch(() => {}));
 }
 
 function escapeHtml(s) {
@@ -496,6 +508,7 @@ function setActiveNav(view) {
     inbox: el('viewInbox'),
     dialpad: el('viewDialpad'),
     calls: el('viewCalls'),
+    voicemails: el('viewVoicemails'),
     contacts: el('viewContacts'),
     numbers: el('viewNumbers'),
     settings: el('viewSettings')
@@ -510,6 +523,7 @@ function setActiveNav(view) {
     inbox: el('navInbox'),
     dialpad: el('navDialpad'),
     calls: el('navCalls'),
+    voicemails: el('navVoicemails'),
     contacts: el('navContacts'),
     numbers: el('navNumbers'),
     settings: el('navSettings')
@@ -539,6 +553,9 @@ function setActiveNav(view) {
     loadVoiceRouting().catch(() => {});
     loadVoicemails().catch(() => {});
   }
+  if (view === 'voicemails') {
+    loadVoicemails().catch(() => {});
+  }
 }
 
 function wireNavigation() {
@@ -546,6 +563,7 @@ function wireNavigation() {
     const h = String(window.location.hash || '').replace('#', '');
     if (h === 'dialpad') return setActiveNav('dialpad');
     if (h === 'calls') return setActiveNav('calls');
+    if (h === 'voicemails') return setActiveNav('voicemails');
     if (h === 'contacts') return setActiveNav('contacts');
     if (h === 'numbers') return setActiveNav('numbers');
     if (h === 'settings') return setActiveNav('settings');
