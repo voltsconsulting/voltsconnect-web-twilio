@@ -55,22 +55,6 @@ final class Auth
             return false;
         }
         $_SESSION['user_id'] = (int) $pdo->lastInsertId();
-
-        $phone = Config::get('TWILIO_PHONE_NUMBER');
-        if (is_string($phone) && trim($phone) !== '') {
-            $phone = trim($phone);
-            $pdo->prepare('INSERT IGNORE INTO numbers (phone_number, friendly_name) VALUES (:pn, NULL)')
-                ->execute([':pn' => $phone]);
-
-            $numStmt = $pdo->prepare('SELECT id FROM numbers WHERE phone_number = :pn LIMIT 1');
-            $numStmt->execute([':pn' => $phone]);
-            $numberId = (int) (($numStmt->fetch()['id'] ?? 0) ?: 0);
-
-            if ($numberId > 0) {
-                $pdo->prepare('INSERT IGNORE INTO user_numbers (user_id, number_id, is_default) VALUES (:uid, :nid, 1)')
-                    ->execute([':uid' => (int) $_SESSION['user_id'], ':nid' => $numberId]);
-            }
-        }
         return true;
     }
 

@@ -111,20 +111,19 @@ But you should still set `BASE_URL` explicitly in `.env`.
 
 ## 7) Twilio setup
 
-You need these Twilio values:
+Twilio credentials are managed **in the database** (Admin UI), not in `.env`.
 
-- `TWILIO_ACCOUNT_SID`
-- `TWILIO_AUTH_TOKEN`
+In the app (admin):
 
-For browser calling (Voice JS SDK token generation):
+- Settings → Twilio Accounts
+- Add your:
+  - Account SID
+  - Auth Token
+  - (optional) API Key / API Secret
+  - (optional) TwiML App SID
+  - Default From Number
 
-- `TWILIO_API_KEY`
-- `TWILIO_API_SECRET`
-- `TWILIO_TWIML_APP_SID`
-
-For SMS defaults:
-
-- `TWILIO_PHONE_NUMBER` (E.164, e.g. `+15551234567`)
+Then set the default Twilio account in Settings.
 
 ### 7.1 Configure Twilio webhooks
 
