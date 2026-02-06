@@ -1242,7 +1242,7 @@ if ($uri === '/install' && $method === 'GET') {
         $content .= '<label class="small" style="display:flex;align-items:center;gap:8px;margin-top:6px">'
             . '<input type="checkbox" name="validate_webhook" value="1">'
             . ' Enable Twilio webhook validation (recommended)'
-            . ' <button type="button" class="btn" style="padding:0 8px;min-width:auto;height:22px;line-height:20px" onclick="var e=document.getElementById(\'twilioWebhookHelp\'); if(e){ e.style.display = (e.style.display===\'none\'||e.style.display===\'\') ? \"block\" : \"none\"; }">i</button>'
+            . ' <button type="button" class="btn" style="padding:0 8px;min-width:auto;height:22px;line-height:20px" onclick="var e=document.getElementById(\'twilioWebhookHelp\'); if(e){ e.style.display = (e.style.display===\'none\' || e.style.display===\'\') ? \'block\' : \'none\'; }">i</button>'
             . '</label>';
         $content .= '<div id="twilioWebhookHelp" class="small" style="display:none;margin-top:6px">'
             . 'When enabled, the app verifies Twilio webhook signatures (X-Twilio-Signature) to ensure inbound webhooks really came from Twilio. '

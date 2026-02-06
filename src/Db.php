@@ -83,6 +83,20 @@ final class Db
             KEY idx_contacts_name (name)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci');
 
+        $pdo->exec('CREATE TABLE IF NOT EXISTS numbers (
+            id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+            phone_number VARCHAR(32) NOT NULL,
+            friendly_name VARCHAR(255) NULL,
+            twilio_account_id BIGINT UNSIGNED NULL,
+            voice_forward_number VARCHAR(32) NULL,
+            voice_ring_timeout INT UNSIGNED NULL,
+            created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (id),
+            UNIQUE KEY uq_numbers_phone (phone_number),
+            KEY idx_numbers_twilio_account_id (twilio_account_id),
+            CONSTRAINT fk_numbers_twilio_account_id FOREIGN KEY (twilio_account_id) REFERENCES twilio_accounts(id) ON DELETE SET NULL
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci');
+
         $pdo->exec('CREATE TABLE IF NOT EXISTS conversations (
             id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
             contact_id BIGINT UNSIGNED NOT NULL,
@@ -130,20 +144,6 @@ final class Db
             KEY idx_notes_created_at (created_at),
             CONSTRAINT fk_notes_conversation_id FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE,
             CONSTRAINT fk_notes_user_id FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci');
-
-        $pdo->exec('CREATE TABLE IF NOT EXISTS numbers (
-            id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-            phone_number VARCHAR(32) NOT NULL,
-            friendly_name VARCHAR(255) NULL,
-            twilio_account_id BIGINT UNSIGNED NULL,
-            voice_forward_number VARCHAR(32) NULL,
-            voice_ring_timeout INT UNSIGNED NULL,
-            created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            PRIMARY KEY (id),
-            UNIQUE KEY uq_numbers_phone (phone_number),
-            KEY idx_numbers_twilio_account_id (twilio_account_id),
-            CONSTRAINT fk_numbers_twilio_account_id FOREIGN KEY (twilio_account_id) REFERENCES twilio_accounts(id) ON DELETE SET NULL
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci');
 
         try {
