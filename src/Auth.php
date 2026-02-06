@@ -42,6 +42,10 @@ final class Auth
             return false;
         }
         $_SESSION['user_id'] = (int) $row['id'];
+        try {
+            session_regenerate_id(true);
+        } catch (\Throwable $e) {
+        }
         return true;
     }
 
@@ -55,6 +59,10 @@ final class Auth
             return false;
         }
         $_SESSION['user_id'] = (int) $pdo->lastInsertId();
+        try {
+            session_regenerate_id(true);
+        } catch (\Throwable $e) {
+        }
         return true;
     }
 

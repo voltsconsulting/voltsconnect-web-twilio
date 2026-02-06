@@ -18,6 +18,10 @@ Config::load($rootDir);
 $forwardedProto = (string)($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? '');
 $isHttps = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') || $forwardedProto === 'https';
 
+ini_set('session.use_strict_mode', '1');
+ini_set('session.use_only_cookies', '1');
+ini_set('session.cookie_httponly', '1');
+
 session_set_cookie_params([
     'lifetime' => 0,
     'path' => '/',
@@ -31,6 +35,12 @@ session_start();
 header('X-Frame-Options: DENY');
 header('X-Content-Type-Options: nosniff');
 header('Referrer-Policy: strict-origin-when-cross-origin');
+
+$flash = '';
+if (isset($_SESSION['_flash']) && is_string($_SESSION['_flash']) && $_SESSION['_flash'] !== '') {
+    $flash = $_SESSION['_flash'];
+    unset($_SESSION['_flash']);
+}
 
 function installed(string $rootDir): bool
 {
@@ -220,6 +230,16 @@ function updateConversationPreview(PDO $pdo, int $conversationId, string $body):
 $uri = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH);
 $method = strtoupper($_SERVER['REQUEST_METHOD'] ?? 'GET');
 
+if (!installed($rootDir)) {
+    if (is_string($uri) && str_starts_with($uri, '/api/')) {
+        json(['error' => 'Not installed'], 503);
+    }
+    $isStatic = is_string($uri) && preg_match('/\.(css|js|png|svg|ico)$/i', $uri) === 1;
+    if ($uri !== '/install' && $uri !== '/install/' && !$isStatic && !str_starts_with((string) $uri, '/assets/') && !str_starts_with((string) $uri, '/webhooks/')) {
+        redirect('/install');
+    }
+}
+
 if (is_string($uri) && str_starts_with($uri, '/api/') && !Auth::check()) {
     json(['error' => 'Not authenticated'], 401);
 }
@@ -260,6 +280,69 @@ function redirect(string $to): void
 {
     header('Location: ' . $to);
     exit;
+}
+
+function isAdminUser(PDO $pdo, ?int $userId): bool
+{
+    if ($userId === null) {
+        return false;
+    }
+    $stmt = $pdo->prepare('SELECT role FROM users WHERE id = :id LIMIT 1');
+    $stmt->execute([':id' => $userId]);
+    return (string) (($stmt->fetch()['role'] ?? '') ?: '') === 'admin';
+}
+
+function envQuote(string $v): string
+{
+    $needs = $v === '' || strpbrk($v, " \t\n\r#=") !== false;
+    if (!$needs) {
+        return $v;
+    }
+    return '"' . str_replace(['\\', '"'], ['\\\\', '\\"'], $v) . '"';
+}
+
+function writeEnvFile(string $rootDir, array $kv): void
+{
+    $lines = [];
+    foreach ($kv as $k => $v) {
+        $key = trim((string) $k);
+        if ($key === '') {
+            continue;
+        }
+        $val = is_string($v) ? $v : (string) $v;
+        $lines[] = $key . '=' . envQuote($val);
+    }
+    $body = implode("\n", $lines) . "\n";
+    $ok = @file_put_contents($rootDir . '/.env', $body);
+    if ($ok === false) {
+        throw new \RuntimeException('Could not write .env. Ensure the project root is writable.');
+    }
+}
+
+function rateLimitCheck(string $rootDir, string $bucket, int $maxHits, int $windowSeconds): bool
+{
+    $dir = $rootDir . '/storage/ratelimits';
+    if (!is_dir($dir)) {
+        @mkdir($dir, 0755, true);
+    }
+    $file = $dir . '/rl_' . sha1($bucket) . '.json';
+    $now = time();
+    $hits = [];
+    if (is_file($file)) {
+        $raw = (string) @file_get_contents($file);
+        $decoded = json_decode($raw, true);
+        if (is_array($decoded)) {
+            $hits = $decoded;
+        }
+    }
+    $min = $now - $windowSeconds;
+    $hits = array_values(array_filter($hits, static fn($t) => is_int($t) && $t >= $min));
+    if (count($hits) >= $maxHits) {
+        return false;
+    }
+    $hits[] = $now;
+    @file_put_contents($file, json_encode($hits));
+    return true;
 }
 
 if ($uri === '/webhooks/twilio/voice/recording' && $method === 'POST') {
@@ -581,10 +664,36 @@ if ($uri === '/api/voice/record-start' && $method === 'POST') {
 
     $callRow = null;
     try {
-        $st = $pdo->prepare('SELECT from_number, to_number FROM calls WHERE twilio_sid = :sid LIMIT 1');
+        $st = $pdo->prepare('SELECT direction, from_number, to_number FROM calls WHERE twilio_sid = :sid LIMIT 1');
         $st->execute([':sid' => $callSid]);
         $callRow = $st->fetch();
     } catch (\Throwable $e) {
+    }
+
+    $uid = Auth::userId();
+    $isAdmin = false;
+    try {
+        $isAdmin = isAdminUser($pdo, $uid);
+    } catch (\Throwable $e) {
+        $isAdmin = false;
+    }
+
+    if (!$isAdmin && is_array($callRow) && !empty($callRow)) {
+        $dir = trim((string) (($callRow['direction'] ?? '') ?: ''));
+        $fromPnAuth = trim((string) (($callRow['from_number'] ?? '') ?: ''));
+        $toPnAuth = trim((string) (($callRow['to_number'] ?? '') ?: ''));
+        $twilioPn = $dir === 'outbound' ? $fromPnAuth : $toPnAuth;
+        if ($uid !== null && $twilioPn !== '') {
+            $chk = $pdo->prepare('SELECT 1
+                FROM user_numbers un
+                INNER JOIN numbers n ON n.id = un.number_id
+                WHERE un.user_id = :uid AND n.phone_number = :pn
+                LIMIT 1');
+            $chk->execute([':uid' => $uid, ':pn' => $twilioPn]);
+            if (!$chk->fetch()) {
+                json(['error' => 'Forbidden'], 403);
+            }
+        }
     }
 
     $fromPn = is_array($callRow) ? trim((string) (($callRow['from_number'] ?? '') ?: '')) : '';
@@ -647,7 +756,10 @@ if ($uri === '/api/voice/recording' && $method === 'GET') {
     $row = null;
     $isVoicemail = false;
     try {
-        $st = $pdo->prepare('SELECT recording_url, from_number, to_number FROM calls WHERE recording_sid = :sid OR recording_url LIKE :like LIMIT 1');
+        $st = $pdo->prepare('SELECT recording_url, direction, from_number, to_number
+            FROM calls
+            WHERE recording_sid = :sid OR recording_url LIKE :like
+            LIMIT 1');
         $st->execute([':sid' => $recSid, ':like' => '%' . $recSid . '%']);
         $row = $st->fetch();
     } catch (\Throwable $e) {
@@ -674,8 +786,33 @@ if ($uri === '/api/voice/recording' && $method === 'GET') {
     }
 
     $recordingUrl = trim((string) (($row['recording_url'] ?? '') ?: ''));
+    $direction = trim((string) (($row['direction'] ?? '') ?: ''));
     $fromNumber = trim((string) (($row['from_number'] ?? '') ?: ''));
     $toNumber = trim((string) (($row['to_number'] ?? '') ?: ''));
+
+    if (!$isVoicemail) {
+        $uid = Auth::userId();
+        $isAdmin = false;
+        try {
+            $isAdmin = isAdminUser($pdo, $uid);
+        } catch (\Throwable $e) {
+            $isAdmin = false;
+        }
+        if (!$isAdmin) {
+            $twilioPn = $direction === 'outbound' ? $fromNumber : $toNumber;
+            if ($uid !== null && $twilioPn !== '') {
+                $chk = $pdo->prepare('SELECT 1
+                    FROM user_numbers un
+                    INNER JOIN numbers n ON n.id = un.number_id
+                    WHERE un.user_id = :uid AND n.phone_number = :pn
+                    LIMIT 1');
+                $chk->execute([':uid' => $uid, ':pn' => $twilioPn]);
+                if (!$chk->fetch()) {
+                    json(['error' => 'Forbidden'], 403);
+                }
+            }
+        }
+    }
 
     $accountSid = '';
     $token = '';
@@ -914,7 +1051,8 @@ function baseUrl(): string
 
 function validateTwilioWebhook(?PDO $pdo = null): bool
 {
-    $enabled = Config::get('TWILIO_VALIDATE_WEBHOOK', '0');
+    $default = (Config::get('APP_ENV', 'local') === 'local') ? '0' : '1';
+    $enabled = Config::get('TWILIO_VALIDATE_WEBHOOK', $default);
     if ($enabled !== '1') {
         return true;
     }
@@ -1018,6 +1156,11 @@ if ($uri === '/login' && $method === 'GET') {
 }
 
 if ($uri === '/login' && $method === 'POST') {
+    $ip = (string) ($_SERVER['REMOTE_ADDR'] ?? '');
+    if (!rateLimitCheck($rootDir, 'login:' . $ip, 10, 900)) {
+        $_SESSION['_flash'] = 'Too many login attempts. Try again in a few minutes.';
+        redirect('/login');
+    }
     $pdo = getPdo($rootDir);
     $email = trim((string)($_POST['email'] ?? ''));
     $password = (string)($_POST['password'] ?? '');
@@ -1035,7 +1178,189 @@ if ($uri === '/login' && $method === 'POST') {
     redirect('/app');
 }
 
+if ($uri === '/install' && $method === 'GET') {
+    if (installed($rootDir)) {
+        redirect('/login');
+    }
+
+    $step = (int) ($_GET['step'] ?? 1);
+    if ($step < 1) {
+        $step = 1;
+    }
+    if ($step > 3) {
+        $step = 3;
+    }
+
+    $content = '<div class="topbar"><div class="brand">Twilio Platform</div></div>';
+    $content .= '<div class="card"><h2 style="margin:0 0 12px 0">Install</h2>';
+    if (is_string($flash) && $flash !== '') {
+        $content .= '<div class="error">' . h($flash) . '</div>';
+    }
+
+    if ($step === 1) {
+        $checks = [];
+        $checks[] = ['PHP 8+', PHP_VERSION, version_compare(PHP_VERSION, '8.0.0', '>=')];
+        $checks[] = ['PDO MySQL', extension_loaded('pdo_mysql') ? 'enabled' : 'missing', extension_loaded('pdo_mysql')];
+        $checks[] = ['OpenSSL', extension_loaded('openssl') ? 'enabled' : 'missing', extension_loaded('openssl')];
+        $checks[] = ['storage/ writable', is_writable($rootDir . '/storage') ? 'writable' : 'not writable', is_writable($rootDir . '/storage')];
+        $checks[] = ['project root writable (.env)', is_writable($rootDir) ? 'writable' : 'not writable', is_writable($rootDir)];
+
+        $content .= '<div class="small">Step 1 of 3: Server checks</div><div style="height:10px"></div>';
+        $content .= '<div class="row" style="flex-direction:column;gap:8px">';
+        foreach ($checks as $c) {
+            [$label, $val, $ok] = $c;
+            $content .= '<div class="row" style="justify-content:space-between"><div>' . h((string) $label) . '</div><div class="small">' . h((string) $val) . ' ' . ($ok ? 'OK' : 'FAIL') . '</div></div>';
+        }
+        $content .= '</div><div style="height:14px"></div>';
+        $content .= '<a class="btn primary" href="/install?step=2">Continue</a>';
+        $content .= '</div>';
+        render('Install', $content);
+        exit;
+    }
+
+    if ($step === 2) {
+        $content .= '<div class="small">Step 2 of 3: Database + Base URL</div><div style="height:10px"></div>';
+        $content .= '<form method="post" action="/install?step=2">';
+        $content .= '<div class="row" style="flex-direction:column">';
+        $content .= '<input class="input" name="db_host" placeholder="DB Host" value="localhost" required>';
+        $content .= '<input class="input" name="db_port" placeholder="DB Port" value="3306" required>';
+        $content .= '<input class="input" name="db_database" placeholder="DB Name" required>';
+        $content .= '<input class="input" name="db_username" placeholder="DB Username" required>';
+        $content .= '<input class="input" name="db_password" placeholder="DB Password" type="password">';
+        $guess = baseUrl();
+        $content .= '<input class="input" name="base_url" placeholder="Base URL (https://your-domain)" value="' . h($guess) . '" required>';
+        $content .= '<label class="small" style="display:flex;align-items:center;gap:8px;margin-top:6px"><input type="checkbox" name="validate_webhook" value="1"> Enable Twilio webhook validation (recommended)</label>';
+        $content .= '</div><div style="height:12px"></div>';
+        $content .= '<button class="btn primary" type="submit">Save & Continue</button> ';
+        $content .= '<a class="btn" href="/install?step=1">Back</a>';
+        $content .= '</form></div>';
+        render('Install', $content);
+        exit;
+    }
+
+    $content .= '<div class="small">Step 3 of 3: Create admin user</div><div style="height:10px"></div>';
+    $content .= '<form method="post" action="/install?step=3">';
+    $content .= '<div class="row" style="flex-direction:column">';
+    $content .= '<input class="input" name="email" type="email" placeholder="Admin email" required>';
+    $content .= '<input class="input" name="password" type="password" placeholder="Admin password (min 8 chars)" minlength="8" required>';
+    $content .= '</div><div style="height:12px"></div>';
+    $content .= '<button class="btn primary" type="submit">Finish Install</button> ';
+    $content .= '<a class="btn" href="/install?step=2">Back</a>';
+    $content .= '</form></div>';
+    render('Install', $content);
+    exit;
+}
+
+if ($uri === '/install' && $method === 'POST') {
+    if (installed($rootDir)) {
+        redirect('/login');
+    }
+    $step = (int) ($_GET['step'] ?? 1);
+
+    if ($step === 2) {
+        $dbHost = trim((string) ($_POST['db_host'] ?? ''));
+        $dbPort = trim((string) ($_POST['db_port'] ?? ''));
+        $dbName = trim((string) ($_POST['db_database'] ?? ''));
+        $dbUser = trim((string) ($_POST['db_username'] ?? ''));
+        $dbPass = (string) ($_POST['db_password'] ?? '');
+        $baseUrl = trim((string) ($_POST['base_url'] ?? ''));
+
+        if ($dbHost === '' || $dbPort === '' || $dbName === '' || $dbUser === '' || $baseUrl === '') {
+            $_SESSION['_flash'] = 'All fields except DB password are required.';
+            redirect('/install?step=2');
+        }
+
+        try {
+            $dsn = 'mysql:host=' . $dbHost . ';port=' . $dbPort . ';dbname=' . $dbName . ';charset=utf8mb4';
+            $test = new PDO($dsn, $dbUser, $dbPass, [
+                PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+                PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+            ]);
+            Db::ensureSchema($test);
+        } catch (\Throwable $e) {
+            $_SESSION['_flash'] = 'Database connection failed.';
+            redirect('/install?step=2');
+        }
+
+        try {
+            $appKey = bin2hex(random_bytes(16));
+        } catch (\Throwable $e) {
+            $appKey = bin2hex(openssl_random_pseudo_bytes(16));
+        }
+
+        $validateWebhook = !empty($_POST['validate_webhook']) ? '1' : '0';
+
+        try {
+            writeEnvFile($rootDir, [
+                'APP_ENV' => 'production',
+                'APP_KEY' => $appKey,
+                'APP_INSTALLED' => '0',
+                'ALLOW_REGISTER' => '0',
+                'DB_HOST' => $dbHost,
+                'DB_PORT' => $dbPort,
+                'DB_DATABASE' => $dbName,
+                'DB_USERNAME' => $dbUser,
+                'DB_PASSWORD' => $dbPass,
+                'TWILIO_VALIDATE_WEBHOOK' => $validateWebhook,
+                'BASE_URL' => $baseUrl,
+            ]);
+        } catch (\Throwable $e) {
+            $_SESSION['_flash'] = $e->getMessage();
+            redirect('/install?step=2');
+        }
+
+        $_SESSION['_flash'] = 'Saved. Next: create admin user.';
+        redirect('/install?step=3');
+    }
+
+    if ($step === 3) {
+        try {
+            Config::load($rootDir);
+            $pdo = getPdo($rootDir);
+        } catch (\Throwable $e) {
+            $_SESSION['_flash'] = 'Database is not configured yet.';
+            redirect('/install?step=2');
+        }
+
+        $email = trim((string) ($_POST['email'] ?? ''));
+        $password = (string) ($_POST['password'] ?? '');
+        if ($email === '' || strlen($password) < 8) {
+            $_SESSION['_flash'] = 'Enter a valid email and a password of at least 8 characters.';
+            redirect('/install?step=3');
+        }
+
+        try {
+            $existing = $pdo->query("SELECT id FROM users WHERE role = 'admin' LIMIT 1")->fetch();
+            if ($existing) {
+                $_SESSION['_flash'] = 'Admin already exists. If you want to reinstall, delete storage/installed.lock.';
+                redirect('/login');
+            }
+        } catch (\Throwable $e) {
+        }
+
+        try {
+            $hash = password_hash($password, PASSWORD_DEFAULT);
+            $stmt = $pdo->prepare("INSERT INTO users (email, password_hash, role) VALUES (:e, :h, 'admin')");
+            $stmt->execute([':e' => $email, ':h' => $hash]);
+        } catch (\Throwable $e) {
+            $_SESSION['_flash'] = 'Could not create admin (email may already exist).';
+            redirect('/install?step=3');
+        }
+
+        @file_put_contents($rootDir . '/storage/installed.lock', date('c') . "\n");
+        $_SESSION['_flash'] = 'Installed. Please sign in.';
+        redirect('/login');
+    }
+
+    redirect('/install');
+}
+
 if ($uri === '/register' && $method === 'GET') {
+    $allow = Config::get('ALLOW_REGISTER', (Config::get('APP_ENV', 'local') === 'local') ? '1' : '0');
+    if ($allow !== '1') {
+        $_SESSION['_flash'] = 'Registration is disabled.';
+        redirect('/login');
+    }
     $msg = '';
     if (is_string($flash) && $flash !== '') {
         $msg = '<div class="error">' . h($flash) . '</div>';
@@ -1058,6 +1383,16 @@ if ($uri === '/register' && $method === 'GET') {
 }
 
 if ($uri === '/register' && $method === 'POST') {
+    $allow = Config::get('ALLOW_REGISTER', (Config::get('APP_ENV', 'local') === 'local') ? '1' : '0');
+    if ($allow !== '1') {
+        $_SESSION['_flash'] = 'Registration is disabled.';
+        redirect('/login');
+    }
+    $ip = (string) ($_SERVER['REMOTE_ADDR'] ?? '');
+    if (!rateLimitCheck($rootDir, 'register:' . $ip, 5, 900)) {
+        $_SESSION['_flash'] = 'Too many registration attempts. Try again in a few minutes.';
+        redirect('/register');
+    }
     $pdo = getPdo($rootDir);
     $email = trim((string)($_POST['email'] ?? ''));
     $password = (string)($_POST['password'] ?? '');
