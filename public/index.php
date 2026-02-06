@@ -645,6 +645,7 @@ if ($uri === '/api/voice/recording' && $method === 'GET') {
     }
 
     $row = null;
+    $isVoicemail = false;
     try {
         $st = $pdo->prepare('SELECT recording_url, from_number, to_number FROM calls WHERE recording_sid = :sid OR recording_url LIKE :like LIMIT 1');
         $st->execute([':sid' => $recSid, ':like' => '%' . $recSid . '%']);
@@ -653,7 +654,23 @@ if ($uri === '/api/voice/recording' && $method === 'GET') {
     }
 
     if (!is_array($row) || empty($row)) {
+        try {
+            $st = $pdo->prepare('SELECT recording_url, from_number, to_number FROM voicemails WHERE recording_url LIKE :like LIMIT 1');
+            $st->execute([':like' => '%' . $recSid . '%']);
+            $row = $st->fetch();
+            if (is_array($row) && !empty($row)) {
+                $isVoicemail = true;
+            }
+        } catch (\Throwable $e) {
+        }
+    }
+
+    if (!is_array($row) || empty($row)) {
         json(['error' => 'Recording not found'], 404);
+    }
+
+    if ($isVoicemail) {
+        requireAdmin($pdo);
     }
 
     $recordingUrl = trim((string) (($row['recording_url'] ?? '') ?: ''));

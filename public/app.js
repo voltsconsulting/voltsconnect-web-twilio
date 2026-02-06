@@ -200,7 +200,13 @@ function renderVoicemails() {
     const to = escapeHtml(v.to_number || '');
     const dur = v.recording_duration ? `${Number(v.recording_duration)}s` : '';
     const url = String(v.recording_url || '').trim();
-    const link = url ? `<a class="btn" href="${escapeHtml(url)}" target="_blank">Open</a>` : '';
+    let sid = '';
+    if (url) {
+      const m = url.match(/\/Recordings\/(RE[a-zA-Z0-9]+)/);
+      if (m && m[1]) sid = String(m[1]);
+    }
+    const proxied = sid ? `/api/voice/recording?sid=${encodeURIComponent(sid)}` : '';
+    const link = proxied ? `<a class="btn" href="${escapeHtml(proxied)}" target="_blank">Open</a>` : '';
     return `<div class="item">
       <div class="row" style="align-items:center;justify-content:space-between">
         <div><strong>Voicemail</strong></div>
