@@ -482,7 +482,13 @@ if ($uri === '/webhooks/twilio/voice/voicemail' && $method === 'POST') {
     try {
         $stmt = $pdo->query("SELECT email FROM users WHERE role = 'admin'");
         $admins = $stmt->fetchAll();
-        $recLink = $recUrl !== '' ? ($recUrl . '.mp3') : '';
+        $recSid = '';
+        if ($recUrl !== '') {
+            if (preg_match('/\/Recordings\/(RE[a-zA-Z0-9]+)/', $recUrl, $m)) {
+                $recSid = (string) ($m[1] ?? '');
+            }
+        }
+        $recLink = $recSid !== '' ? (baseUrl() . '/api/voice/recording?sid=' . rawurlencode($recSid)) : '';
         if ($recLink !== '' && is_array($admins)) {
             $subject = 'Voicemail from ' . ($from !== '' ? $from : 'Unknown');
             $when = date('c');
