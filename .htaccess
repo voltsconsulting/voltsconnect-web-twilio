@@ -1,0 +1,19 @@
+Options -Indexes
+
+<IfModule mod_rewrite.c>
+  RewriteEngine On
+
+  # Block access to sensitive paths/files when everything is inside public_html
+  RewriteRule ^(src|vendor|storage)/ - [F,L]
+  RewriteRule ^\.env$ - [F,L]
+  RewriteRule ^composer\.(json|lock)$ - [F,L]
+
+  # Serve files from /public when they exist (e.g. /styles.css -> /public/styles.css)
+  RewriteCond %{REQUEST_URI} !^/public/
+  RewriteCond %{DOCUMENT_ROOT}/public%{REQUEST_URI} -f
+  RewriteRule ^(.*)$ public/$1 [L]
+
+  # Front controller
+  RewriteCond %{REQUEST_URI} !^/public/
+  RewriteRule ^(.*)$ public/index.php [L]
+</IfModule>
