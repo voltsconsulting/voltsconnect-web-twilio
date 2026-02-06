@@ -24,6 +24,12 @@ final class Config
         self::$loaded = true;
     }
 
+    public static function reload(string $rootDir): void
+    {
+        self::$loaded = false;
+        self::load($rootDir);
+    }
+
     public static function get(string $key, ?string $default = null): ?string
     {
         $value = $_ENV[$key] ?? $_SERVER[$key] ?? getenv($key);

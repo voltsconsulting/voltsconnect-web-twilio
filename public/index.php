@@ -1005,6 +1005,9 @@ function baseUrl(): string
             }
             $path = (string)($parsed['path'] ?? '');
             $path = rtrim($path, '/');
+            if ($path === '/public' || str_ends_with($path, '/public')) {
+                $path = preg_replace('/\/public$/', '', $path);
+            }
             return rtrim($scheme . '://' . $host . $path, '/');
         }
 
@@ -1035,6 +1038,13 @@ function baseUrl(): string
         $dir = str_replace('\\', '/', dirname($scriptName));
         if ($dir !== '/' && $dir !== '.' && $dir !== '\\') {
             $basePath = rtrim($dir, '/');
+        }
+    }
+
+    if ($basePath === '/public' || str_ends_with($basePath, '/public')) {
+        $basePath = preg_replace('/\/public$/', '', $basePath);
+        if ($basePath === '/') {
+            $basePath = '';
         }
     }
 
@@ -1229,7 +1239,15 @@ if ($uri === '/install' && $method === 'GET') {
         $content .= '<input class="input" name="db_password" placeholder="DB Password" type="password">';
         $guess = baseUrl();
         $content .= '<input class="input" name="base_url" placeholder="Base URL (https://your-domain)" value="' . h($guess) . '" required>';
-        $content .= '<label class="small" style="display:flex;align-items:center;gap:8px;margin-top:6px"><input type="checkbox" name="validate_webhook" value="1"> Enable Twilio webhook validation (recommended)</label>';
+        $content .= '<label class="small" style="display:flex;align-items:center;gap:8px;margin-top:6px">'
+            . '<input type="checkbox" name="validate_webhook" value="1">'
+            . ' Enable Twilio webhook validation (recommended)'
+            . ' <button type="button" class="btn" style="padding:0 8px;min-width:auto;height:22px;line-height:20px" onclick="var e=document.getElementById(\'twilioWebhookHelp\'); if(e){ e.style.display = (e.style.display===\'none\'||e.style.display===\'\') ? \"block\" : \"none\"; }">i</button>'
+            . '</label>';
+        $content .= '<div id="twilioWebhookHelp" class="small" style="display:none;margin-top:6px">'
+            . 'When enabled, the app verifies Twilio webhook signatures (X-Twilio-Signature) to ensure inbound webhooks really came from Twilio. '
+            . 'Recommended for production. If misconfigured (wrong Base URL, proxy URL rewriting), webhooks may be rejected.'
+            . '</div>';
         $content .= '</div><div style="height:12px"></div>';
         $content .= '<button class="btn primary" type="submit">Save & Continue</button> ';
         $content .= '<a class="btn" href="/install?step=1">Back</a>';
@@ -1264,6 +1282,28 @@ if ($uri === '/install' && $method === 'POST') {
         $dbUser = trim((string) ($_POST['db_username'] ?? ''));
         $dbPass = (string) ($_POST['db_password'] ?? '');
         $baseUrl = trim((string) ($_POST['base_url'] ?? ''));
+        $baseUrl = preg_replace('/\s+/', '', $baseUrl);
+        if ($baseUrl !== '' && !preg_match('/^https?:\/\//i', $baseUrl)) {
+            $baseUrl = 'https://' . ltrim($baseUrl, '/');
+        }
+        $parsed = parse_url($baseUrl);
+        if (is_array($parsed) && isset($parsed['host'])) {
+            $scheme = (string) (($parsed['scheme'] ?? '') ?: 'https');
+            $host = (string) $parsed['host'];
+            if (isset($parsed['port'])) {
+                $host .= ':' . (string) $parsed['port'];
+            }
+            $path = rtrim((string) ($parsed['path'] ?? ''), '/');
+            if ($path === '/public' || str_ends_with($path, '/public')) {
+                $path = preg_replace('/\/public$/', '', $path);
+            }
+            $baseUrl = rtrim($scheme . '://' . $host . $path, '/');
+        } else {
+            $baseUrl = rtrim($baseUrl, '/');
+            if ($baseUrl === 'https://') {
+                $baseUrl = '';
+            }
+        }
 
         if ($dbHost === '' || $dbPort === '' || $dbName === '' || $dbUser === '' || $baseUrl === '') {
             $_SESSION['_flash'] = 'All fields except DB password are required.';
@@ -1278,7 +1318,7 @@ if ($uri === '/install' && $method === 'POST') {
             ]);
             Db::ensureSchema($test);
         } catch (\Throwable $e) {
-            $_SESSION['_flash'] = 'Database connection failed.';
+            $_SESSION['_flash'] = 'Database connection failed (' . $dbHost . ':' . $dbPort . '/' . $dbName . '): ' . $e->getMessage();
             redirect('/install?step=2');
         }
 
@@ -1304,6 +1344,7 @@ if ($uri === '/install' && $method === 'POST') {
                 'TWILIO_VALIDATE_WEBHOOK' => $validateWebhook,
                 'BASE_URL' => $baseUrl,
             ]);
+            Config::reload($rootDir);
         } catch (\Throwable $e) {
             $_SESSION['_flash'] = $e->getMessage();
             redirect('/install?step=2');
