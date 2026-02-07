@@ -1258,7 +1258,7 @@ function requireAdmin(PDO $pdo): void
             json(['error' => 'Admin only'], 403);
         }
         http_response_code(403);
-        render('Forbidden', '<div class="topbar"><div class="brand">Twilio Platform</div></div><div class="card"><h2 style="margin:0 0 8px 0">403</h2><div class="small">Admin only.</div></div>');
+        render('Forbidden', '<div class="topbar"><div class="brand">VOLTS CONNECT</div></div><div class="card"><h2 style="margin:0 0 8px 0">403</h2><div class="small">Admin only.</div></div>');
         exit;
     }
 }
@@ -1326,7 +1326,7 @@ if ($uri === '/login' && $method === 'GET') {
         $msg = '<div class="error">' . h($flash) . '</div>';
     }
 
-    $content = '<div class="topbar"><div class="brand"><img class="brandLogo brandLogoDark" src="/assets/img/logo-dark.svg" alt="Logo"><img class="brandLogo brandLogoLight" src="/assets/img/logo-light.svg" alt="Logo">Twilio Platform</div></div>';
+    $content = '<div class="topbar"><div class="brand"><img class="brandLogo brandLogoDark" src="/assets/img/logo-dark.svg" alt="Logo"><img class="brandLogo brandLogoLight" src="/assets/img/logo-light.svg" alt="Logo">VOLTS CONNECT</div></div>';
     $content .= '<div class="card"><h2 style="margin:0 0 12px 0">Login</h2>';
     $content .= $msg;
     $content .= '<form method="post" action="/login">';
@@ -1378,7 +1378,7 @@ if ($uri === '/install' && $method === 'GET') {
         $step = 3;
     }
 
-    $content = '<div class="topbar"><div class="brand"><img class="brandLogo brandLogoDark" src="/assets/img/logo-dark.svg" alt="Logo"><img class="brandLogo brandLogoLight" src="/assets/img/logo-light.svg" alt="Logo">Twilio Platform</div></div>';
+    $content = '<div class="topbar"><div class="brand"><img class="brandLogo brandLogoDark" src="/assets/img/logo-dark.svg" alt="Logo"><img class="brandLogo brandLogoLight" src="/assets/img/logo-light.svg" alt="Logo">VOLTS CONNECT</div></div>';
     $content .= '<div class="card"><h2 style="margin:0 0 12px 0">Install</h2>';
     if (is_string($flash) && $flash !== '') {
         $content .= '<div class="error">' . h($flash) . '</div>';
@@ -1584,7 +1584,7 @@ if ($uri === '/register' && $method === 'GET') {
         $msg = '<div class="error">' . h($flash) . '</div>';
     }
 
-    $content = '<div class="topbar"><div class="brand"><img class="brandLogo brandLogoDark" src="/assets/img/logo-dark.svg" alt="Logo"><img class="brandLogo brandLogoLight" src="/assets/img/logo-light.svg" alt="Logo">Twilio Platform</div></div>';
+    $content = '<div class="topbar"><div class="brand"><img class="brandLogo brandLogoDark" src="/assets/img/logo-dark.svg" alt="Logo"><img class="brandLogo brandLogoLight" src="/assets/img/logo-light.svg" alt="Logo">VOLTS CONNECT</div></div>';
     $content .= '<div class="card"><h2 style="margin:0 0 12px 0">Create account</h2>';
     $content .= $msg;
     $content .= '<form method="post" action="/register">';
@@ -1638,7 +1638,7 @@ if ($uri === '/app' && $method === 'GET') {
 
     $content = '<div class="appShell">';
     $content .= '<header class="appTop">';
-    $content .= '<div class="brand"><img class="brandLogo brandLogoDark" src="/assets/img/logo-dark.svg" alt="Logo"><img class="brandLogo brandLogoLight" src="/assets/img/logo-light.svg" alt="Logo">Web - Twilio</div>';
+    $content .= '<div class="brand"><img class="brandLogo brandLogoDark" src="/assets/img/logo-dark.svg" alt="Logo"><img class="brandLogo brandLogoLight" src="/assets/img/logo-light.svg" alt="Logo">VOLTS CONNECT</div>';
     $content .= '<div class="topActions">';
     $content .= '<button class="btn" type="button" id="themeToggle">Theme</button>';
     $content .= '<button class="btn" type="button" id="rightToggle">Contact</button>';
@@ -2971,4 +2971,5 @@ if ($uri === '/api/admin/users/set-role' && $method === 'POST') {
 }
 
 http_response_code(404);
-render('Not Found', '<div class="topbar"><div class="brand">Twilio Platform</div></div><div class="card"><h2 style="margin:0 0 8px 0">404</h2><div class="small">Page not found.</div></div>');
+render('Not Found', '<div class="topbar"><div class="brand">VOLTS CONNECT</div></div><div class="card"><h2 style="margin:0 0 8px 0">404</h2><div class="small">Page not found.</div></div>');
+

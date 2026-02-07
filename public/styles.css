@@ -1,8 +1,8 @@
 :root{--bg:#0b1220;--bg2:#0e1730;--panel:#121b2d;--panel2:#0f1728;--text:#e8eefc;--muted:#9db0d4;--accent:#5b8cff;--danger:#ff5b6b;--border:rgba(255,255,255,.08);--shadow:0 14px 50px rgba(0,0,0,.35);--bubbleIn:rgba(255,255,255,.08);--bubbleOut:rgba(91,140,255,.28)}
 [data-theme="light"]{--bg:#ffffff;--bg2:#ffffff;--panel:#ffffff;--panel2:#ffffff;--text:#111827;--muted:#5b6477;--accent:#2f6bff;--danger:#e11d48;--border:rgba(17,24,39,.12);--shadow:0 14px 50px rgba(17,24,39,.12);--bubbleIn:rgba(17,24,39,.06);--bubbleOut:rgba(47,107,255,.16)}
 *{box-sizing:border-box}html,body{height:100%}body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;background:var(--bg);color:var(--text)}
-.container{max-width:1100px;margin:0 auto;padding:24px}
-.topbar{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:20px}
+.container{max-width:720px;margin:0 auto;padding:28px}
+.topbar{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:24px}
 .brand{font-weight:700;letter-spacing:.2px;display:flex;align-items:center;gap:10px}
 .brandLogo{width:200px;height:auto;display:block}
 .brandLogoLight{display:none}
@@ -34,6 +34,7 @@
 
 .appShell{height:100vh;display:flex;flex-direction:column}
 .appTop{display:flex;align-items:center;justify-content:space-between;gap:14px;padding:16px 18px;border-bottom:1px solid var(--border);background:linear-gradient(180deg,rgba(255,255,255,.04),rgba(255,255,255,0))}
+.appTop .brandLogo{width:140px}
 .topActions{display:flex;align-items:center;gap:10px}
 
 .dashboard{flex:1;min-height:0;display:grid;grid-template-columns:240px 1fr;gap:14px;padding:14px}

@@ -1774,6 +1774,7 @@ window.addEventListener('load', async () => {
   wireCalls();
   wireNumbersAdmin();
   wireTwilioAccountsSettings();
+  wireSmtpSettings();
   wireVoiceRoutingSettings();
   wireVoicemails();
   wireDefaultTwilioSettings();
