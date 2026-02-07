@@ -1239,6 +1239,7 @@ function render(string $title, string $bodyHtml): void
     } else {
         echo $bodyHtml;
     }
+    echo '<div class="toastHost" id="toastHost"></div>';
     echo '</body></html>';
 }
 
@@ -1317,6 +1318,38 @@ if ($uri === '/api/admin/settings/smtp' && $method === 'POST') {
         appSettingSet($pdo, 'smtp_password_enc', encryptSecret($pass));
     }
 
+    json(['ok' => true]);
+}
+
+if ($uri === '/api/admin/settings/smtp/test' && $method === 'POST') {
+    Auth::requireLogin();
+    $pdo = getPdo($rootDir);
+    requireAdmin($pdo);
+
+    $enabled = appSettingGet($pdo, 'smtp_enabled', '0') === '1';
+    if (!$enabled) {
+        json(['error' => 'Enable SMTP first'], 400);
+    }
+    $host = trim(appSettingGet($pdo, 'smtp_host', ''));
+    if ($host === '') {
+        json(['error' => 'SMTP host is required'], 400);
+    }
+
+    $payload = json_decode((string) file_get_contents('php://input'), true);
+    if (!is_array($payload)) {
+        json(['error' => 'Invalid JSON'], 400);
+    }
+    $toEmail = trim((string) ($payload['to_email'] ?? ''));
+    if ($toEmail === '' || filter_var($toEmail, FILTER_VALIDATE_EMAIL) === false) {
+        json(['error' => 'Enter a valid test email address'], 400);
+    }
+
+    $subject = 'VOLTS CONNECT test email';
+    $body = "This is a test email from VOLTS CONNECT.\n\nIf you received this, your SMTP settings are working.";
+    $ok = sendEmail($pdo, $toEmail, $subject, $body);
+    if (!$ok) {
+        json(['error' => 'Failed to send test email'], 500);
+    }
     json(['ok' => true]);
 }
 
@@ -1641,7 +1674,6 @@ if ($uri === '/app' && $method === 'GET') {
     $content .= '<div class="brand"><img class="brandLogo brandLogoDark" src="/assets/img/logo-dark.svg" alt="Logo"><img class="brandLogo brandLogoLight" src="/assets/img/logo-light.svg" alt="Logo">VOLTS CONNECT</div>';
     $content .= '<div class="topActions">';
     $content .= '<button class="btn" type="button" id="themeToggle">Theme</button>';
-    $content .= '<button class="btn" type="button" id="rightToggle">Contact</button>';
     $content .= '<form method="post" action="/logout" style="margin:0"><button class="btn danger" type="submit">Logout</button></form>';
     $content .= '</div>';
     $content .= '</header>';
@@ -1818,67 +1850,8 @@ if ($uri === '/app' && $method === 'GET') {
 
     $content .= '<section class="view" id="viewSettings" style="display:none">';
     $content .= '<div class="pageHeader"><div class="pageTitle">Settings</div><div class="small">Migrations and configuration</div></div>';
+
     $content .= '<div class="card">';
-    $content .= '<div class="small" style="margin-bottom:10px">Database</div>';
-    $content .= '<a class="btn" href="/migrate" target="_blank">Run migration</a>';
-    $content .= '</div>';
-
-    $content .= '<div class="card" style="margin-top:12px">';
-    $content .= '<div class="row" style="align-items:center;justify-content:space-between">';
-    $content .= '<div class="small">SMTP email</div>';
-    $content .= '<div class="row">';
-    $content .= '<button class="btn" type="button" id="refreshSmtp">Refresh</button>';
-    $content .= '<button class="btn primary" type="button" id="saveSmtp">Save</button>';
-    $content .= '</div>';
-    $content .= '</div>';
-    $content .= '<div style="height:12px"></div>';
-    $content .= '<label class="small" style="display:block;margin-bottom:10px"><input type="checkbox" id="smtpEnabled"> Enable SMTP (recommended)</label>';
-    $content .= '<div class="pageGrid">';
-    $content .= '<div class="card">';
-    $content .= '<div class="small" style="margin-bottom:8px">Server</div>';
-    $content .= '<input class="input" id="smtpHost" placeholder="SMTP host">';
-    $content .= '<div style="height:10px"></div>';
-    $content .= '<input class="input" id="smtpPort" placeholder="SMTP port (e.g. 587)">';
-    $content .= '<div style="height:10px"></div>';
-    $content .= '<select class="input" id="smtpSecure"><option value="tls">TLS</option><option value="ssl">SSL</option><option value="none">None</option></select>';
-    $content .= '</div>';
-    $content .= '<div class="card">';
-    $content .= '<div class="small" style="margin-bottom:8px">Auth + From</div>';
-    $content .= '<input class="input" id="smtpUsername" placeholder="SMTP username (optional)">';
-    $content .= '<div style="height:10px"></div>';
-    $content .= '<input class="input" id="smtpPassword" placeholder="SMTP password (leave blank to keep unchanged)" type="password">';
-    $content .= '<div style="height:10px"></div>';
-    $content .= '<input class="input" id="smtpFromEmail" placeholder="From email (optional)">';
-    $content .= '<div style="height:10px"></div>';
-    $content .= '<input class="input" id="smtpFromName" placeholder="From name (optional)">';
-    $content .= '</div>';
-    $content .= '</div>';
-    $content .= '<div class="small" style="margin-top:10px">Used for voicemail notifications and other alerts. Password is stored encrypted in the database.</div>';
-    $content .= '</div>';
-
-    $content .= '<div class="card" style="margin-top:12px">';
-    $content .= '<div class="row" style="align-items:center;justify-content:space-between">';
-    $content .= '<div class="small">Webhooks</div>';
-    $content .= '<button class="btn" type="button" id="showWebhooksInfo">i</button>';
-    $content .= '</div>';
-    $content .= '<div class="small" style="margin-top:10px">SMS: ' . h(baseUrl()) . '/webhooks/twilio/sms</div>';
-    $content .= '<div class="small" style="margin-top:6px">Voice: ' . h(baseUrl()) . '/webhooks/twilio/voice</div>';
-    $content .= '</div>';
-
-    $content .= '<div class="card" style="margin-top:12px">';
-    $content .= '<div class="row" style="align-items:center;justify-content:space-between">';
-    $content .= '<div class="small">Default Twilio profile</div>';
-    $content .= '<div class="row">';
-    $content .= '<button class="btn" type="button" id="refreshDefaultTwilio">Refresh</button>';
-    $content .= '<button class="btn primary" type="button" id="saveDefaultTwilio">Save</button>';
-    $content .= '</div>';
-    $content .= '</div>';
-    $content .= '<div style="height:10px"></div>';
-    $content .= '<select class="input" id="defaultTwilioAccount"></select>';
-    $content .= '<div class="small" style="margin-top:10px">Used when a number does not have an account profile selected.</div>';
-    $content .= '</div>';
-
-    $content .= '<div class="card" style="margin-top:12px">';
     $content .= '<div class="row" style="align-items:center;justify-content:space-between">';
     $content .= '<div class="small">Twilio Accounts (credential profiles)</div>';
     $content .= '<button class="btn" type="button" id="refreshTwilioAccounts">Refresh</button>';
@@ -1912,6 +1885,56 @@ if ($uri === '/app' && $method === 'GET') {
 
     $content .= '<div class="card" style="margin-top:12px">';
     $content .= '<div class="row" style="align-items:center;justify-content:space-between">';
+    $content .= '<div class="small">Default Twilio profile</div>';
+    $content .= '<div class="row">';
+    $content .= '<button class="btn" type="button" id="refreshDefaultTwilio">Refresh</button>';
+    $content .= '<button class="btn primary" type="button" id="saveDefaultTwilio">Save</button>';
+    $content .= '</div>';
+    $content .= '</div>';
+    $content .= '<div style="height:10px"></div>';
+    $content .= '<select class="input" id="defaultTwilioAccount"></select>';
+    $content .= '<div class="small" style="margin-top:10px">Used when a number does not have an account profile selected.</div>';
+    $content .= '</div>';
+
+    $content .= '<div class="card" style="margin-top:12px">';
+    $content .= '<div class="row" style="align-items:center;justify-content:space-between">';
+    $content .= '<div class="small">SMTP email</div>';
+    $content .= '<div class="row">';
+    $content .= '<button class="btn" type="button" id="refreshSmtp">Refresh</button>';
+    $content .= '<button class="btn primary" type="button" id="saveSmtp">Save</button>';
+    $content .= '</div>';
+    $content .= '</div>';
+    $content .= '<div style="height:12px"></div>';
+    $content .= '<label class="small" style="display:block;margin-bottom:10px"><input type="checkbox" id="smtpEnabled"> Enable SMTP (recommended)</label>';
+    $content .= '<div class="pageGrid">';
+    $content .= '<div class="card">';
+    $content .= '<div class="small" style="margin-bottom:8px">Server</div>';
+    $content .= '<input class="input" id="smtpHost" placeholder="SMTP host">';
+    $content .= '<div style="height:10px"></div>';
+    $content .= '<input class="input" id="smtpPort" placeholder="SMTP port (e.g. 587)">';
+    $content .= '<div style="height:10px"></div>';
+    $content .= '<select class="input" id="smtpSecure"><option value="tls">TLS</option><option value="ssl">SSL</option><option value="none">None</option></select>';
+    $content .= '</div>';
+    $content .= '<div class="card">';
+    $content .= '<div class="small" style="margin-bottom:8px">Auth + From</div>';
+    $content .= '<input class="input" id="smtpUsername" placeholder="SMTP username (optional)">';
+    $content .= '<div style="height:10px"></div>';
+    $content .= '<input class="input" id="smtpPassword" placeholder="SMTP password (leave blank to keep unchanged)" type="password">';
+    $content .= '<div style="height:10px"></div>';
+    $content .= '<input class="input" id="smtpFromEmail" placeholder="From email (optional)">';
+    $content .= '<div style="height:10px"></div>';
+    $content .= '<input class="input" id="smtpFromName" placeholder="From name (optional)">';
+    $content .= '</div>';
+    $content .= '</div>';
+    $content .= '<div class="row" style="margin-top:10px;align-items:flex-end">';
+    $content .= '<input class="input" id="smtpTestTo" placeholder="Test email to (e.g. you@company.com)" style="flex:1">';
+    $content .= '<button class="btn" type="button" id="sendSmtpTest">Send test</button>';
+    $content .= '</div>';
+    $content .= '<div class="small" style="margin-top:10px">Notifications sent: Voicemail alerts (sent to all admin users). Password is stored encrypted in the database.</div>';
+    $content .= '</div>';
+
+    $content .= '<div class="card" style="margin-top:12px">';
+    $content .= '<div class="row" style="align-items:center;justify-content:space-between">';
     $content .= '<div class="small">Voice routing (inbound fallback)</div>';
     $content .= '<div class="row">';
     $content .= '<button class="btn" type="button" id="refreshVoiceRouting">Refresh</button>';
@@ -1940,11 +1963,17 @@ if ($uri === '/app' && $method === 'GET') {
 
     $content .= '<div class="card" style="margin-top:12px">';
     $content .= '<div class="row" style="align-items:center;justify-content:space-between">';
-    $content .= '<div class="small">Voicemails</div>';
-    $content .= '<button class="btn" type="button" id="refreshVoicemails">Refresh</button>';
+    $content .= '<div class="small">Webhooks</div>';
+    $content .= '<button class="btn" type="button" id="showWebhooksInfo">i</button>';
     $content .= '</div>';
-    $content .= '<div style="height:12px"></div>';
-    $content .= '<div class="list" id="voicemailsList"></div>';
+    $content .= '<div class="small" style="margin-top:10px">SMS: ' . h(baseUrl()) . '/webhooks/twilio/sms</div>';
+    $content .= '<div class="small" style="margin-top:6px">Voice: ' . h(baseUrl()) . '/webhooks/twilio/voice</div>';
+    $content .= '</div>';
+
+    $content .= '<div class="card" style="margin-top:12px">';
+    $content .= '<div class="small" style="margin-bottom:10px">Database</div>';
+    $content .= '<a class="btn" href="/migrate" target="_blank">Run migration</a>';
+    $content .= '<div class="small" style="margin-top:10px">Only run after an update, when instructed.</div>';
     $content .= '</div>';
 
     $content .= '</section>';

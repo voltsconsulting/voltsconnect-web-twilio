@@ -24,6 +24,34 @@ let state = {
   polling: null
 };
 
+function showToast(message, type) {
+  const host = el('toastHost');
+  if (!host) return;
+  const text = String(message || '').trim();
+  if (!text) return;
+  const t = (type === 'error' || type === 'success' || type === 'info') ? type : 'info';
+
+  const node = document.createElement('div');
+  node.className = `toast ${t}`;
+  node.textContent = text;
+  host.appendChild(node);
+
+  const remove = () => {
+    try { node.classList.add('hide'); } catch {}
+    setTimeout(() => { try { node.remove(); } catch {} }, 220);
+  };
+  const timeout = t === 'error' ? 4500 : 2500;
+  const id = setTimeout(remove, timeout);
+  node.addEventListener('click', () => {
+    clearTimeout(id);
+    remove();
+  });
+}
+
+function toastSuccess(message) { showToast(message, 'success'); }
+function toastError(message) { showToast(message, 'error'); }
+function toastInfo(message) { showToast(message, 'info'); }
+
 function el(id) {
   return document.getElementById(id);
 }
@@ -81,11 +109,11 @@ function wireNewMessage() {
     const to = normalizeE164(String(toEl.value || '').trim());
     const fromId = fromEl.value ? Number(fromEl.value) : 0;
     if (!to) {
-      alert('Enter a valid To number');
+      toastError('Enter a valid To number');
       return;
     }
     if (!fromId) {
-      alert('Select a From number');
+      toastError('Select a From number');
       return;
     }
 
@@ -98,7 +126,7 @@ function wireNewMessage() {
         await selectConversation(Number(res.conversation_id));
       }
     } catch (e) {
-      alert(e && e.message ? e.message : String(e));
+      toastError(e && e.message ? e.message : String(e));
     } finally {
       start.disabled = false;
     }
@@ -138,8 +166,9 @@ function renderTwilioAccounts() {
         await apiPost('/api/admin/twilio-accounts/delete', { id });
         await loadTwilioAccounts();
         await loadNumbersAdmin();
+        toastSuccess('Deleted');
       } catch (e) {
-        alert(e && e.message ? e.message : String(e));
+        toastError(e && e.message ? e.message : String(e));
       }
     });
   });
@@ -179,8 +208,9 @@ function wireTwilioAccountsSettings() {
         await apiPost('/api/admin/twilio-accounts/add', payload);
         await loadTwilioAccounts();
         await loadNumbersAdmin();
+        toastSuccess('Saved');
       } catch (e) {
-        alert(e && e.message ? e.message : String(e));
+        toastError(e && e.message ? e.message : String(e));
       }
     });
   }
@@ -189,10 +219,10 @@ function wireTwilioAccountsSettings() {
 function renderVoicemails() {
   const list = el('voicemailsList');
   const listMain = el('voicemailsListMain');
-  if (!list) return;
+  if (!list && !listMain) return;
   const items = Array.isArray(state.voicemails) ? state.voicemails : [];
   if (items.length === 0) {
-    list.innerHTML = '<div class="item"><div class="small">No voicemails yet</div></div>';
+    if (list) list.innerHTML = '<div class="item"><div class="small">No voicemails yet</div></div>';
     if (listMain) listMain.innerHTML = '<div class="item"><div class="small">No voicemails yet</div></div>';
     return;
   }
@@ -223,7 +253,7 @@ function renderVoicemails() {
     </div>`;
   }).join('');
 
-  list.innerHTML = html;
+  if (list) list.innerHTML = html;
   if (listMain) listMain.innerHTML = html;
 }
 
@@ -308,8 +338,9 @@ function wireVoiceRoutingSettings() {
       try {
         save.disabled = true;
         await saveVoiceRouting();
+        toastSuccess('Saved');
       } catch (e) {
-        alert(e && e.message ? e.message : String(e));
+        toastError(e && e.message ? e.message : String(e));
       } finally {
         save.disabled = false;
       }
@@ -326,10 +357,31 @@ function wireSmtpSettings() {
       try {
         save.disabled = true;
         await saveSmtpSettings();
+        toastSuccess('Saved');
       } catch (e) {
-        alert(e && e.message ? e.message : String(e));
+        toastError(e && e.message ? e.message : String(e));
       } finally {
         save.disabled = false;
+      }
+    });
+  }
+
+  const testBtn = el('sendSmtpTest');
+  if (testBtn) {
+    testBtn.addEventListener('click', async () => {
+      const to_email = String(el('smtpTestTo') ? el('smtpTestTo').value : '').trim();
+      if (!to_email) {
+        toastError('Enter a test email address');
+        return;
+      }
+      try {
+        testBtn.disabled = true;
+        await apiPost('/api/admin/settings/smtp/test', { to_email });
+        toastSuccess('Test email sent');
+      } catch (e) {
+        toastError(e && e.message ? e.message : String(e));
+      } finally {
+        testBtn.disabled = false;
       }
     });
   }
@@ -601,7 +653,6 @@ function setActiveNav(view) {
     loadDefaultTwilioSettings().catch(() => {});
     loadSmtpSettings().catch(() => {});
     loadVoiceRouting().catch(() => {});
-    loadVoicemails().catch(() => {});
   }
   if (view === 'voicemails') {
     loadVoicemails().catch(() => {});
@@ -655,8 +706,9 @@ function renderContacts() {
       const name = String(input ? input.value : '').trim();
       try {
         await apiPost('/api/contacts/update', { id, name });
+        toastSuccess('Saved');
       } catch (e) {
-        alert(e && e.message ? e.message : String(e));
+        toastError(e && e.message ? e.message : String(e));
       }
     });
   });
@@ -744,7 +796,7 @@ async function loadCalls() {
 function wireCalls() {
   const btn = el('refreshCalls');
   if (!btn) return;
-  btn.addEventListener('click', () => loadCalls().catch((e) => alert(e && e.message ? e.message : String(e))));
+  btn.addEventListener('click', () => loadCalls().catch((e) => toastError(e && e.message ? e.message : String(e))));
 }
 
 function renderNumbersAdmin() {
@@ -878,10 +930,10 @@ function renderNumbersAdmin() {
           user_ids: selectedUserIds,
           default_user_id,
         });
-        alert('Saved');
+        toastSuccess('Saved');
         await loadNumbersAdmin();
       } catch (e) {
-        alert(e && e.message ? e.message : String(e));
+        toastError(e && e.message ? e.message : String(e));
       }
     });
   });
@@ -932,10 +984,10 @@ function wireDefaultTwilioSettings() {
       if (!confirm('Save default Twilio profile?')) return;
       try {
         await saveDefaultTwilioSettings();
-        alert('Saved');
+        toastSuccess('Saved');
         await loadDefaultTwilioSettings();
       } catch (e) {
-        alert(e && e.message ? e.message : String(e));
+        toastError(e && e.message ? e.message : String(e));
       }
     });
   }
@@ -945,7 +997,7 @@ function wireWebhooksInfo() {
   const b = el('showWebhooksInfo');
   if (!b) return;
   b.addEventListener('click', () => {
-    alert('Use these URLs in Twilio. SMS webhook goes in Messaging settings. Voice webhook goes in your TwiML App Voice URL.');
+    toastInfo('Use these URLs in Twilio. SMS webhook goes in Messaging settings. Voice webhook goes in your TwiML App Voice URL.');
   });
 }
 
@@ -964,8 +1016,9 @@ function wireNumbersAdmin() {
         if (el('newNumber')) el('newNumber').value = '';
         if (el('newNumberName')) el('newNumberName').value = '';
         await loadNumbersAdmin();
+        toastSuccess('Added');
       } catch (e) {
-        alert(e && e.message ? e.message : String(e));
+        toastError(e && e.message ? e.message : String(e));
       }
     });
   }
@@ -1015,8 +1068,9 @@ function renderAdminUsers() {
       try {
         await apiPost('/api/admin/users/set-role', { id, role });
         await loadAdminUsers();
+        toastSuccess('Saved');
       } catch (e) {
-        alert(e && e.message ? e.message : String(e));
+        toastError(e && e.message ? e.message : String(e));
       }
     });
   });
@@ -1031,9 +1085,9 @@ function renderAdminUsers() {
       try {
         await apiPost('/api/admin/users/reset-password', { id, password });
         if (input) input.value = '';
-        alert('Password reset');
+        toastSuccess('Password reset');
       } catch (e) {
-        alert(e && e.message ? e.message : String(e));
+        toastError(e && e.message ? e.message : String(e));
       }
     });
   });
@@ -1061,8 +1115,9 @@ function wireUserManager() {
       if (el('newUserEmail')) el('newUserEmail').value = '';
       if (el('newUserPassword')) el('newUserPassword').value = '';
       await loadAdminUsers();
+      toastSuccess('User created');
     } catch (e) {
-      alert(e && e.message ? e.message : String(e));
+      toastError(e && e.message ? e.message : String(e));
     }
   });
 }
@@ -1127,8 +1182,9 @@ function wireRightPanelActions() {
       try {
         await apiPost('/api/inbox/contact', { conversation_id: cid, name });
         await refreshActive();
+        toastSuccess('Saved');
       } catch (e) {
-        alert(e && e.message ? e.message : String(e));
+        toastError(e && e.message ? e.message : String(e));
       }
     });
   }
@@ -1146,8 +1202,9 @@ function wireRightPanelActions() {
         if (noteEl) noteEl.value = '';
         const notes = await apiGet(`/api/inbox/notes?conversation_id=${encodeURIComponent(cid)}`);
         renderNotes(notes.notes);
+        toastSuccess('Saved');
       } catch (e) {
-        alert(e && e.message ? e.message : String(e));
+        toastError(e && e.message ? e.message : String(e));
       }
     });
   }
@@ -1161,8 +1218,9 @@ function wireRightPanelActions() {
       try {
         await apiPost('/api/inbox/assign', { conversation_id: cid, assigned_user_id: v || null });
         await refreshActive();
+        toastSuccess('Saved');
       } catch (e) {
-        alert(e && e.message ? e.message : String(e));
+        toastError(e && e.message ? e.message : String(e));
       }
     });
   }
@@ -1175,8 +1233,9 @@ function wireRightPanelActions() {
       try {
         await apiPost('/api/inbox/assign', { conversation_id: cid, assigned_user_id: 'me' });
         await refreshActive();
+        toastSuccess('Saved');
       } catch (e) {
-        alert(e && e.message ? e.message : String(e));
+        toastError(e && e.message ? e.message : String(e));
       }
     });
   }
@@ -1189,8 +1248,9 @@ function wireRightPanelActions() {
       try {
         await apiPost('/api/inbox/assign', { conversation_id: cid, assigned_user_id: null });
         await refreshActive();
+        toastSuccess('Saved');
       } catch (e) {
-        alert(e && e.message ? e.message : String(e));
+        toastError(e && e.message ? e.message : String(e));
       }
     });
   }
@@ -1431,7 +1491,7 @@ async function refreshActiveThread(silent) {
 async function sendMessage() {
   const cid = state.activeConversationId;
   if (!cid) {
-    alert('Select a conversation');
+    toastError('Select a conversation');
     return;
   }
 
@@ -1453,7 +1513,7 @@ async function sendMessage() {
       await selectConversation(nextCid);
     }
   } catch (e) {
-    alert(e && e.message ? e.message : String(e));
+    toastError(e && e.message ? e.message : String(e));
   } finally {
     if (btn) btn.disabled = false;
   }
@@ -1542,7 +1602,7 @@ function wireCallControls() {
       if (isRecording) return;
       const sid = String(activeCallSid || (activeCall.parameters ? (activeCall.parameters.CallSid || '') : '')).trim();
       if (!sid) {
-        alert('Call SID not available yet');
+        toastError('Call SID not available yet');
         return;
       }
       rec.disabled = true;
@@ -1551,7 +1611,7 @@ function wireCallControls() {
         isRecording = true;
         rec.textContent = 'Recording';
       } catch (e) {
-        alert(e && e.message ? e.message : String(e));
+        toastError(e && e.message ? e.message : String(e));
       } finally {
         rec.disabled = false;
       }
@@ -1689,7 +1749,7 @@ function wireCalling() {
 
     const fromNumberId = fromSel && fromSel.value ? Number(fromSel.value) : 0;
     if (!fromNumberId) {
-      alert('Select a From number');
+      toastError('Select a From number');
       return;
     }
 
