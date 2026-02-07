@@ -257,6 +257,36 @@ async function loadVoiceRouting() {
   }
 }
 
+async function loadSmtpSettings() {
+  try {
+    const data = await apiGet('/api/admin/settings/smtp');
+    if (el('smtpEnabled')) el('smtpEnabled').checked = !!data.smtp_enabled;
+    if (el('smtpHost')) el('smtpHost').value = String(data.smtp_host ?? '');
+    if (el('smtpPort')) el('smtpPort').value = String(data.smtp_port ?? '');
+    if (el('smtpUsername')) el('smtpUsername').value = String(data.smtp_username ?? '');
+    if (el('smtpSecure')) el('smtpSecure').value = String(data.smtp_secure ?? 'tls');
+    if (el('smtpFromEmail')) el('smtpFromEmail').value = String(data.smtp_from_email ?? '');
+    if (el('smtpFromName')) el('smtpFromName').value = String(data.smtp_from_name ?? '');
+    if (el('smtpPassword')) el('smtpPassword').value = '';
+  } catch (e) {
+  }
+}
+
+async function saveSmtpSettings() {
+  const payload = {
+    smtp_enabled: !!(el('smtpEnabled') && el('smtpEnabled').checked),
+    smtp_host: String(el('smtpHost') ? el('smtpHost').value : '').trim(),
+    smtp_port: Number(el('smtpPort') ? el('smtpPort').value : 587) || 587,
+    smtp_username: String(el('smtpUsername') ? el('smtpUsername').value : '').trim(),
+    smtp_password: String(el('smtpPassword') ? el('smtpPassword').value : ''),
+    smtp_secure: String(el('smtpSecure') ? el('smtpSecure').value : 'tls').trim(),
+    smtp_from_email: String(el('smtpFromEmail') ? el('smtpFromEmail').value : '').trim(),
+    smtp_from_name: String(el('smtpFromName') ? el('smtpFromName').value : '').trim(),
+  };
+  await apiPost('/api/admin/settings/smtp', payload);
+  if (el('smtpPassword')) el('smtpPassword').value = '';
+}
+
 async function saveVoiceRouting() {
   const payload = {
     voice_ring_timeout: Number(el('voiceRingTimeout') ? el('voiceRingTimeout').value : 20) || 20,
@@ -276,11 +306,30 @@ function wireVoiceRoutingSettings() {
   if (save) {
     save.addEventListener('click', async () => {
       try {
+        save.disabled = true;
         await saveVoiceRouting();
-        await loadVoiceRouting();
-        alert('Saved');
       } catch (e) {
         alert(e && e.message ? e.message : String(e));
+      } finally {
+        save.disabled = false;
+      }
+    });
+  }
+}
+
+function wireSmtpSettings() {
+  const refresh = el('refreshSmtp');
+  if (refresh) refresh.addEventListener('click', () => loadSmtpSettings().catch(() => {}));
+  const save = el('saveSmtp');
+  if (save) {
+    save.addEventListener('click', async () => {
+      try {
+        save.disabled = true;
+        await saveSmtpSettings();
+      } catch (e) {
+        alert(e && e.message ? e.message : String(e));
+      } finally {
+        save.disabled = false;
       }
     });
   }
@@ -550,6 +599,7 @@ function setActiveNav(view) {
   if (view === 'settings') {
     loadTwilioAccounts().catch(() => {});
     loadDefaultTwilioSettings().catch(() => {});
+    loadSmtpSettings().catch(() => {});
     loadVoiceRouting().catch(() => {});
     loadVoicemails().catch(() => {});
   }

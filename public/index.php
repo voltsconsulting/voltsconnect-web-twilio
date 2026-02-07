@@ -172,6 +172,120 @@ function appSettingSet(PDO $pdo, string $key, string $value): void
         ->execute([':k' => $key, ':v' => $value]);
 }
 
+function cryptoKeyBytes(): string
+{
+    $k = (string) (Config::get('APP_KEY', '') ?? '');
+    $k = trim($k);
+    if ($k === '') {
+        return '';
+    }
+    return hash('sha256', $k, true);
+}
+
+function encryptSecret(string $plain): string
+{
+    if ($plain === '') {
+        return '';
+    }
+    $key = cryptoKeyBytes();
+    if ($key === '' || !function_exists('openssl_encrypt')) {
+        return $plain;
+    }
+    try {
+        $iv = random_bytes(16);
+    } catch (\Throwable $e) {
+        return $plain;
+    }
+    $ct = openssl_encrypt($plain, 'aes-256-cbc', $key, OPENSSL_RAW_DATA, $iv);
+    if ($ct === false) {
+        return $plain;
+    }
+    return base64_encode($iv . $ct);
+}
+
+function decryptSecret(string $stored): string
+{
+    if ($stored === '') {
+        return '';
+    }
+    $key = cryptoKeyBytes();
+    if ($key === '' || !function_exists('openssl_decrypt')) {
+        return $stored;
+    }
+    $raw = base64_decode($stored, true);
+    if (!is_string($raw) || strlen($raw) < 17) {
+        return $stored;
+    }
+    $iv = substr($raw, 0, 16);
+    $ct = substr($raw, 16);
+    if (!is_string($iv) || !is_string($ct)) {
+        return $stored;
+    }
+    $pt = openssl_decrypt($ct, 'aes-256-cbc', $key, OPENSSL_RAW_DATA, $iv);
+    if ($pt === false) {
+        return $stored;
+    }
+    return (string) $pt;
+}
+
+function sendEmail(PDO $pdo, string $toEmail, string $subject, string $body): bool
+{
+    $enabled = appSettingGet($pdo, 'smtp_enabled', '0') === '1';
+    if (!$enabled) {
+        return @mail($toEmail, $subject, $body);
+    }
+
+    $host = trim(appSettingGet($pdo, 'smtp_host', ''));
+    $port = (int) appSettingGet($pdo, 'smtp_port', '587');
+    $user = trim(appSettingGet($pdo, 'smtp_username', ''));
+    $passEnc = (string) (appSettingGet($pdo, 'smtp_password_enc', '') ?? '');
+    $pass = decryptSecret($passEnc);
+    $secure = trim(appSettingGet($pdo, 'smtp_secure', 'tls'));
+    $fromEmail = trim(appSettingGet($pdo, 'smtp_from_email', ''));
+    $fromName = trim(appSettingGet($pdo, 'smtp_from_name', ''));
+
+    if ($host === '' || $port <= 0) {
+        return @mail($toEmail, $subject, $body);
+    }
+
+    $phpMailerClass = 'PHPMailer\\PHPMailer\\PHPMailer';
+    if (class_exists($phpMailerClass)) {
+        try {
+            $mail = new $phpMailerClass(true);
+            $mail->isSMTP();
+            $mail->Host = $host;
+            $mail->Port = $port;
+            $mail->SMTPAuth = $user !== '';
+            if ($mail->SMTPAuth) {
+                $mail->Username = $user;
+                $mail->Password = $pass;
+            }
+            if ($secure === 'ssl' || $secure === 'tls') {
+                $mail->SMTPSecure = $secure;
+            }
+            $mail->CharSet = 'UTF-8';
+            if ($fromEmail !== '') {
+                $mail->setFrom($fromEmail, $fromName !== '' ? $fromName : null);
+            }
+            $mail->addAddress($toEmail);
+            $mail->Subject = $subject;
+            $mail->Body = $body;
+            $mail->AltBody = $body;
+            $mail->isHTML(false);
+            $mail->send();
+            return true;
+        } catch (\Throwable $e) {
+            return @mail($toEmail, $subject, $body);
+        }
+    }
+
+    $headers = '';
+    if ($fromEmail !== '') {
+        $headers = 'From: ' . ($fromName !== '' ? ($fromName . ' <' . $fromEmail . '>') : $fromEmail) . "\r\n";
+    }
+    return @mail($toEmail, $subject, $body, $headers);
+}
+
 function getOrCreateNumberId(PDO $pdo, string $phoneNumber): ?int
 {
     $phoneNumber = trim($phoneNumber);
@@ -496,7 +610,7 @@ if ($uri === '/webhooks/twilio/voice/voicemail' && $method === 'POST') {
             foreach ($admins as $a) {
                 $toEmail = (string) (($a['email'] ?? '') ?: '');
                 if ($toEmail !== '') {
-                    @mail($toEmail, $subject, $body);
+                    sendEmail($pdo, $toEmail, $subject, $body);
                 }
             }
         }
@@ -1149,13 +1263,70 @@ function requireAdmin(PDO $pdo): void
     }
 }
 
+if ($uri === '/api/admin/settings/smtp' && $method === 'GET') {
+    Auth::requireLogin();
+    $pdo = getPdo($rootDir);
+    requireAdmin($pdo);
+
+    json([
+        'smtp_enabled' => appSettingGet($pdo, 'smtp_enabled', '0') === '1',
+        'smtp_host' => appSettingGet($pdo, 'smtp_host', ''),
+        'smtp_port' => (int) appSettingGet($pdo, 'smtp_port', '587'),
+        'smtp_username' => appSettingGet($pdo, 'smtp_username', ''),
+        'smtp_secure' => appSettingGet($pdo, 'smtp_secure', 'tls'),
+        'smtp_from_email' => appSettingGet($pdo, 'smtp_from_email', ''),
+        'smtp_from_name' => appSettingGet($pdo, 'smtp_from_name', ''),
+        'has_password' => appSettingGet($pdo, 'smtp_password_enc', '') !== '',
+    ]);
+}
+
+if ($uri === '/api/admin/settings/smtp' && $method === 'POST') {
+    Auth::requireLogin();
+    $pdo = getPdo($rootDir);
+    requireAdmin($pdo);
+
+    $payload = json_decode((string) file_get_contents('php://input'), true);
+    if (!is_array($payload)) {
+        json(['error' => 'Invalid JSON'], 400);
+    }
+
+    $enabled = !empty($payload['smtp_enabled']) ? '1' : '0';
+    $host = trim((string) ($payload['smtp_host'] ?? ''));
+    $port = (int) ($payload['smtp_port'] ?? 587);
+    if ($port <= 0) {
+        $port = 587;
+    }
+    $user = trim((string) ($payload['smtp_username'] ?? ''));
+    $pass = (string) ($payload['smtp_password'] ?? '');
+    $secure = trim((string) ($payload['smtp_secure'] ?? 'tls'));
+    if (!in_array($secure, ['tls', 'ssl', 'none'], true)) {
+        $secure = 'tls';
+    }
+    $fromEmail = trim((string) ($payload['smtp_from_email'] ?? ''));
+    $fromName = trim((string) ($payload['smtp_from_name'] ?? ''));
+
+    appSettingSet($pdo, 'smtp_enabled', $enabled);
+    appSettingSet($pdo, 'smtp_host', $host);
+    appSettingSet($pdo, 'smtp_port', (string) $port);
+    appSettingSet($pdo, 'smtp_username', $user);
+    appSettingSet($pdo, 'smtp_secure', $secure);
+    appSettingSet($pdo, 'smtp_from_email', $fromEmail);
+    appSettingSet($pdo, 'smtp_from_name', $fromName);
+
+    if (trim($pass) !== '') {
+        appSettingSet($pdo, 'smtp_password_enc', encryptSecret($pass));
+    }
+
+    json(['ok' => true]);
+}
+
 if ($uri === '/login' && $method === 'GET') {
     $msg = '';
     if (is_string($flash) && $flash !== '') {
         $msg = '<div class="error">' . h($flash) . '</div>';
     }
 
-    $content = '<div class="topbar"><div class="brand">Twilio Platform</div></div>';
+    $content = '<div class="topbar"><div class="brand"><img class="brandLogo brandLogoDark" src="/assets/img/logo-dark.svg" alt="Logo"><img class="brandLogo brandLogoLight" src="/assets/img/logo-light.svg" alt="Logo">Twilio Platform</div></div>';
     $content .= '<div class="card"><h2 style="margin:0 0 12px 0">Login</h2>';
     $content .= $msg;
     $content .= '<form method="post" action="/login">';
@@ -1207,7 +1378,7 @@ if ($uri === '/install' && $method === 'GET') {
         $step = 3;
     }
 
-    $content = '<div class="topbar"><div class="brand">Twilio Platform</div></div>';
+    $content = '<div class="topbar"><div class="brand"><img class="brandLogo brandLogoDark" src="/assets/img/logo-dark.svg" alt="Logo"><img class="brandLogo brandLogoLight" src="/assets/img/logo-light.svg" alt="Logo">Twilio Platform</div></div>';
     $content .= '<div class="card"><h2 style="margin:0 0 12px 0">Install</h2>';
     if (is_string($flash) && $flash !== '') {
         $content .= '<div class="error">' . h($flash) . '</div>';
@@ -1413,7 +1584,7 @@ if ($uri === '/register' && $method === 'GET') {
         $msg = '<div class="error">' . h($flash) . '</div>';
     }
 
-    $content = '<div class="topbar"><div class="brand">Twilio Platform</div></div>';
+    $content = '<div class="topbar"><div class="brand"><img class="brandLogo brandLogoDark" src="/assets/img/logo-dark.svg" alt="Logo"><img class="brandLogo brandLogoLight" src="/assets/img/logo-light.svg" alt="Logo">Twilio Platform</div></div>';
     $content .= '<div class="card"><h2 style="margin:0 0 12px 0">Create account</h2>';
     $content .= $msg;
     $content .= '<form method="post" action="/register">';
@@ -1650,6 +1821,39 @@ if ($uri === '/app' && $method === 'GET') {
     $content .= '<div class="card">';
     $content .= '<div class="small" style="margin-bottom:10px">Database</div>';
     $content .= '<a class="btn" href="/migrate" target="_blank">Run migration</a>';
+    $content .= '</div>';
+
+    $content .= '<div class="card" style="margin-top:12px">';
+    $content .= '<div class="row" style="align-items:center;justify-content:space-between">';
+    $content .= '<div class="small">SMTP email</div>';
+    $content .= '<div class="row">';
+    $content .= '<button class="btn" type="button" id="refreshSmtp">Refresh</button>';
+    $content .= '<button class="btn primary" type="button" id="saveSmtp">Save</button>';
+    $content .= '</div>';
+    $content .= '</div>';
+    $content .= '<div style="height:12px"></div>';
+    $content .= '<label class="small" style="display:block;margin-bottom:10px"><input type="checkbox" id="smtpEnabled"> Enable SMTP (recommended)</label>';
+    $content .= '<div class="pageGrid">';
+    $content .= '<div class="card">';
+    $content .= '<div class="small" style="margin-bottom:8px">Server</div>';
+    $content .= '<input class="input" id="smtpHost" placeholder="SMTP host">';
+    $content .= '<div style="height:10px"></div>';
+    $content .= '<input class="input" id="smtpPort" placeholder="SMTP port (e.g. 587)">';
+    $content .= '<div style="height:10px"></div>';
+    $content .= '<select class="input" id="smtpSecure"><option value="tls">TLS</option><option value="ssl">SSL</option><option value="none">None</option></select>';
+    $content .= '</div>';
+    $content .= '<div class="card">';
+    $content .= '<div class="small" style="margin-bottom:8px">Auth + From</div>';
+    $content .= '<input class="input" id="smtpUsername" placeholder="SMTP username (optional)">';
+    $content .= '<div style="height:10px"></div>';
+    $content .= '<input class="input" id="smtpPassword" placeholder="SMTP password (leave blank to keep unchanged)" type="password">';
+    $content .= '<div style="height:10px"></div>';
+    $content .= '<input class="input" id="smtpFromEmail" placeholder="From email (optional)">';
+    $content .= '<div style="height:10px"></div>';
+    $content .= '<input class="input" id="smtpFromName" placeholder="From name (optional)">';
+    $content .= '</div>';
+    $content .= '</div>';
+    $content .= '<div class="small" style="margin-top:10px">Used for voicemail notifications and other alerts. Password is stored encrypted in the database.</div>';
     $content .= '</div>';
 
     $content .= '<div class="card" style="margin-top:12px">';
