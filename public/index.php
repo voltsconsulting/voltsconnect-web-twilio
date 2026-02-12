@@ -42,6 +42,102 @@ if (isset($_SESSION['_flash']) && is_string($_SESSION['_flash']) && $_SESSION['_
     unset($_SESSION['_flash']);
 }
 
+$uri = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH);
+$method = strtoupper($_SERVER['REQUEST_METHOD'] ?? 'GET');
+
+if ($uri === '/api/cron/notifications' && $method === 'GET') {
+    $pdo = getPdo($rootDir);
+    $token = trim((string)($_GET['token'] ?? ''));
+    $expected = trim(appSettingGet($pdo, 'notify_cron_token', ''));
+    if ($expected === '' || $token === '' || !hash_equals($expected, $token)) {
+        json(['error' => 'Invalid token'], 403);
+    }
+
+    $rules = $pdo->query("SELECT role_id, reminder_minutes FROM notification_role_rules WHERE event_key = 'sms.unread_reminder' AND enabled = 1 AND reminder_minutes IS NOT NULL")->fetchAll();
+    $sent = 0;
+    if (is_array($rules)) {
+        foreach ($rules as $r) {
+            $roleId = (int) (($r['role_id'] ?? 0) ?: 0);
+            $mins = (int) (($r['reminder_minutes'] ?? 0) ?: 0);
+            if ($roleId <= 0 || $mins <= 0) {
+                continue;
+            }
+
+            $st = $pdo->prepare('SELECT c.id AS conversation_id,
+                    ct.phone_number AS from_number,
+                    n.phone_number AS to_number,
+                    c.last_message_at,
+                    c.last_message_preview,
+                    COALESCE(lm.last_message_id, 0) AS last_message_id,
+                    COALESCE(MAX(cr.last_read_message_id), 0) AS role_max_read_message_id
+                FROM conversations c
+                INNER JOIN contacts ct ON ct.id = c.contact_id
+                LEFT JOIN numbers n ON n.id = c.default_number_id
+                LEFT JOIN (
+                    SELECT conversation_id, MAX(id) AS last_message_id
+                    FROM messages
+                    GROUP BY conversation_id
+                ) lm ON lm.conversation_id = c.id
+                INNER JOIN user_role_assignments ura ON ura.role_id = :rid
+                INNER JOIN users u ON u.id = ura.user_id AND u.is_active = 1
+                LEFT JOIN conversation_reads cr ON cr.conversation_id = c.id AND cr.user_id = u.id
+                WHERE c.last_message_at IS NOT NULL
+                  AND c.last_message_at <= (NOW() - INTERVAL :mins MINUTE)
+                GROUP BY c.id, ct.phone_number, n.phone_number, c.last_message_at, c.last_message_preview, lm.last_message_id
+                HAVING COALESCE(lm.last_message_id, 0) > 0
+                   AND COALESCE(MAX(cr.last_read_message_id), 0) < COALESCE(lm.last_message_id, 0)
+                ORDER BY c.last_message_at DESC
+                LIMIT 50');
+            $st->bindValue(':rid', $roleId, PDO::PARAM_INT);
+            $st->bindValue(':mins', $mins, PDO::PARAM_INT);
+            $st->execute();
+            $convs = $st->fetchAll();
+            if (!is_array($convs)) {
+                $convs = [];
+            }
+
+            foreach ($convs as $c) {
+                $cid = (int) (($c['conversation_id'] ?? 0) ?: 0);
+                if ($cid <= 0) continue;
+                $refKey = 'sms_unread:' . $cid . ':' . $mins;
+
+                try {
+                    $pdo->prepare('INSERT INTO notification_sends (role_id, event_key, ref_key, conversation_id, message_id)
+                        VALUES (:rid, :ek, :rk, :cid, NULL)')
+                        ->execute([':rid' => $roleId, ':ek' => 'sms.unread_reminder', ':rk' => $refKey, ':cid' => $cid]);
+                } catch (\Throwable $e) {
+                    continue;
+                }
+
+                $uStmt = $pdo->prepare('SELECT DISTINCT u.email
+                    FROM users u
+                    INNER JOIN user_role_assignments ura ON ura.user_id = u.id
+                    WHERE ura.role_id = :rid AND u.is_active = 1');
+                $uStmt->execute([':rid' => $roleId]);
+                $users = $uStmt->fetchAll();
+                if (!is_array($users)) $users = [];
+
+                $from = (string) (($c['from_number'] ?? '') ?: '');
+                $to = (string) (($c['to_number'] ?? '') ?: '');
+                $preview = (string) (($c['last_message_preview'] ?? '') ?: '');
+                $when = (string) (($c['last_message_at'] ?? '') ?: '');
+                $subject = 'Unread message reminder';
+                $body = "A conversation has unread messages for {$mins} minutes.\n\nFrom: {$from}\nTo: {$to}\nLast message time: {$when}\nLast message: {$preview}\n";
+
+                foreach ($users as $u) {
+                    $email = (string) (($u['email'] ?? '') ?: '');
+                    if ($email !== '') {
+                        sendEmail($pdo, $email, $subject, $body);
+                        $sent += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    json(['ok' => true, 'sent' => $sent]);
+}
+
 function installed(string $rootDir): bool
 {
     return is_file($rootDir . '/storage/installed.lock') || Config::get('APP_INSTALLED', '0') === '1';
@@ -341,8 +437,61 @@ function updateConversationPreview(PDO $pdo, int $conversationId, string $body):
         ->execute([':p' => $preview, ':id' => $conversationId]);
 }
 
-$uri = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH);
-$method = strtoupper($_SERVER['REQUEST_METHOD'] ?? 'GET');
+if (is_string($uri) && str_starts_with($uri, '/mms/tmp/') && $method === 'GET') {
+    $rest = substr($uri, strlen('/mms/tmp/'));
+    $rest = $rest === false ? '' : $rest;
+    $parts = array_values(array_filter(explode('/', $rest), fn($x) => $x !== ''));
+    $token = (string) ($parts[0] ?? '');
+    if (!preg_match('/^[a-f0-9]{32}$/', $token)) {
+        http_response_code(404);
+        exit;
+    }
+    $dir = $rootDir . '/storage/mms_tmp';
+    $matches = glob($dir . '/' . $token . '_*') ?: [];
+    $path = '';
+    foreach ($matches as $m) {
+        if (is_file($m)) {
+            $path = $m;
+            break;
+        }
+    }
+    if ($path === '') {
+        http_response_code(404);
+        exit;
+    }
+    try {
+        if ((time() - (int) filemtime($path)) > 3600) {
+            @unlink($path);
+            http_response_code(404);
+            exit;
+        }
+    } catch (\Throwable $e) {
+    }
+
+    foreach (glob($dir . '/*') ?: [] as $p) {
+        try {
+            if (is_file($p) && (time() - (int) filemtime($p)) > 3600) {
+                @unlink($p);
+            }
+        } catch (\Throwable $e) {
+        }
+    }
+
+    $ext = strtolower(pathinfo($path, PATHINFO_EXTENSION));
+    if (in_array($ext, ['png'], true)) header('Content-Type: image/png');
+    elseif (in_array($ext, ['jpg', 'jpeg'], true)) header('Content-Type: image/jpeg');
+    elseif (in_array($ext, ['gif'], true)) header('Content-Type: image/gif');
+    elseif (in_array($ext, ['webp'], true)) header('Content-Type: image/webp');
+    elseif (in_array($ext, ['svg'], true)) header('Content-Type: image/svg+xml; charset=utf-8');
+    elseif ($ext === 'pdf') header('Content-Type: application/pdf');
+    elseif (in_array($ext, ['mp4', 'm4v'], true)) header('Content-Type: video/mp4');
+    elseif (in_array($ext, ['mp3'], true)) header('Content-Type: audio/mpeg');
+    else header('Content-Type: application/octet-stream');
+    header('Cache-Control: private, max-age=300');
+    header('X-Content-Type-Options: nosniff');
+    readfile($path);
+    exit;
+}
 
 if (!installed($rootDir)) {
     if (is_string($uri) && str_starts_with($uri, '/api/')) {
@@ -354,17 +503,121 @@ if (!installed($rootDir)) {
     }
 }
 
+function sendRoleNotification(PDO $pdo, string $eventKey, string $refKey, string $subject, string $body, ?int $conversationId = null, ?int $messageId = null): void
+{
+    if ($eventKey === '' || $refKey === '') {
+        return;
+    }
+
+    $roles = [];
+    try {
+        $st = $pdo->prepare('SELECT r.id, r.name
+            FROM roles r
+            INNER JOIN notification_role_rules rr ON rr.role_id = r.id
+            WHERE rr.event_key = :k AND rr.enabled = 1');
+        $st->execute([':k' => $eventKey]);
+        $roles = $st->fetchAll();
+    } catch (\Throwable $e) {
+        $roles = [];
+    }
+    if (!is_array($roles) || count($roles) === 0) {
+        return;
+    }
+
+    foreach ($roles as $r) {
+        $roleId = (int) (($r['id'] ?? 0) ?: 0);
+        if ($roleId <= 0) {
+            continue;
+        }
+
+        try {
+            $pdo->prepare('INSERT INTO notification_sends (role_id, event_key, ref_key, conversation_id, message_id)
+                VALUES (:rid, :ek, :rk, :cid, :mid)')
+                ->execute([
+                    ':rid' => $roleId,
+                    ':ek' => $eventKey,
+                    ':rk' => $refKey,
+                    ':cid' => $conversationId,
+                    ':mid' => $messageId,
+                ]);
+        } catch (\Throwable $e) {
+            continue;
+        }
+
+        try {
+            $uStmt = $pdo->prepare('SELECT DISTINCT u.email
+                FROM users u
+                INNER JOIN user_role_assignments ura ON ura.user_id = u.id
+                WHERE ura.role_id = :rid AND u.is_active = 1');
+            $uStmt->execute([':rid' => $roleId]);
+            $users = $uStmt->fetchAll();
+            if (!is_array($users)) {
+                $users = [];
+            }
+            foreach ($users as $u) {
+                $toEmail = (string) (($u['email'] ?? '') ?: '');
+                if ($toEmail !== '') {
+                    sendEmail($pdo, $toEmail, $subject, $body);
+                }
+            }
+        } catch (\Throwable $e) {
+        }
+    }
+}
+
 if (is_string($uri) && str_starts_with($uri, '/api/') && !Auth::check()) {
     json(['error' => 'Not authenticated'], 401);
+}
+
+require_once $rootDir . '/src/Http/FeatureRoutes.php';
+if (function_exists('handleFeatureRoutes') && handleFeatureRoutes((string) $uri, (string) $method, $rootDir)) {
+    exit;
+}
+
+require_once $rootDir . '/src/Http/BroadcastRoutes.php';
+if (function_exists('handleBroadcastRoutes') && handleBroadcastRoutes((string) $uri, (string) $method, $rootDir)) {
+    exit;
+}
+
+require_once $rootDir . '/src/Http/TemplateRoutes.php';
+if (function_exists('handleTemplateRoutes') && handleTemplateRoutes((string) $uri, (string) $method, $rootDir)) {
+    exit;
+}
+
+require_once $rootDir . '/src/Http/AdminRoutes.php';
+if (function_exists('handleAdminRoutes') && handleAdminRoutes((string) $uri, (string) $method, $rootDir)) {
+    exit;
+}
+
+require_once $rootDir . '/src/Http/CrmRoutes.php';
+if (function_exists('handleCrmRoutes') && handleCrmRoutes((string) $uri, (string) $method, $rootDir)) {
+    exit;
+}
+
+require_once $rootDir . '/src/Http/ContactsRoutes.php';
+if (function_exists('handleContactsRoutes') && handleContactsRoutes((string) $uri, (string) $method, $rootDir)) {
+    exit;
+}
+
+require_once $rootDir . '/src/Http/InboxRoutes.php';
+if (function_exists('handleInboxRoutes') && handleInboxRoutes((string) $uri, (string) $method, $rootDir)) {
+    exit;
+}
+
+require_once $rootDir . '/src/Http/CallsRoutes.php';
+if (function_exists('handleCallsRoutes') && handleCallsRoutes((string) $uri, (string) $method, $rootDir)) {
+    exit;
 }
 
 if (is_string($uri) && str_starts_with($uri, '/assets/img/') && $method === 'GET') {
     $rel = substr($uri, strlen('/assets/img/'));
     $rel = $rel === false ? '' : $rel;
-    $rel = str_replace('..', '', $rel);
-    $path = $rootDir . '/storage/Assets/img/' . $rel;
+    $path = $rootDir . '/public/assets/img/' . $rel;
     if (!is_file($path)) {
-        $path = $rootDir . '/storage/assets/img/' . $rel;
+        $path = $rootDir . '/storage/Assets/img/' . $rel;
+        if (!is_file($path)) {
+            $path = $rootDir . '/storage/assets/img/' . $rel;
+        }
     }
     if (!is_file($path)) {
         http_response_code(404);
@@ -404,6 +657,83 @@ function isAdminUser(PDO $pdo, ?int $userId): bool
     $stmt = $pdo->prepare('SELECT role FROM users WHERE id = :id LIMIT 1');
     $stmt->execute([':id' => $userId]);
     return (string) (($stmt->fetch()['role'] ?? '') ?: '') === 'admin';
+}
+
+function userPermissionKeys(PDO $pdo, ?int $userId): array
+{
+    if ($userId === null) {
+        return [];
+    }
+    if (isAdminUser($pdo, $userId)) {
+        $rows = $pdo->query('SELECT perm_key FROM permissions ORDER BY perm_key ASC')->fetchAll();
+        $out = [];
+        if (is_array($rows)) {
+            foreach ($rows as $r) {
+                $k = (string) (($r['perm_key'] ?? '') ?: '');
+                if ($k !== '') {
+                    $out[$k] = true;
+                }
+            }
+        }
+        return array_keys($out);
+    }
+
+    $stmt = $pdo->prepare('SELECT DISTINCT p.perm_key
+        FROM user_role_assignments ura
+        INNER JOIN role_permissions rp ON rp.role_id = ura.role_id
+        INNER JOIN permissions p ON p.id = rp.permission_id
+        WHERE ura.user_id = :uid');
+    $stmt->execute([':uid' => $userId]);
+    $rows = $stmt->fetchAll();
+    $out = [];
+    if (is_array($rows)) {
+        foreach ($rows as $r) {
+            $k = (string) (($r['perm_key'] ?? '') ?: '');
+            if ($k !== '') {
+                $out[$k] = true;
+            }
+        }
+    }
+    return array_keys($out);
+}
+
+function userHasPermission(PDO $pdo, ?int $userId, string $permKey): bool
+{
+    if ($permKey === '') {
+        return true;
+    }
+    if ($userId === null) {
+        return false;
+    }
+    if (isAdminUser($pdo, $userId)) {
+        return true;
+    }
+    $stmt = $pdo->prepare('SELECT 1
+        FROM user_role_assignments ura
+        INNER JOIN role_permissions rp ON rp.role_id = ura.role_id
+        INNER JOIN permissions p ON p.id = rp.permission_id
+        WHERE ura.user_id = :uid AND p.perm_key = :k
+        LIMIT 1');
+    $stmt->execute([':uid' => $userId, ':k' => $permKey]);
+    return (bool) $stmt->fetch();
+}
+
+function requirePermission(PDO $pdo, string $permKey): void
+{
+    Auth::requireLogin();
+    $uid = Auth::userId();
+    if ($uid === null) {
+        json(['error' => 'Not authenticated'], 401);
+    }
+    if (!userHasPermission($pdo, $uid, $permKey)) {
+        $path = (string) parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH);
+        if (str_starts_with($path, '/api/')) {
+            json(['error' => 'Forbidden'], 403);
+        }
+        http_response_code(403);
+        render('Forbidden', '<div class="topbar"><div class="brand">VOLTS CONNECT</div></div><div class="card"><h2 style="margin:0 0 8px 0">403</h2><div class="small">Forbidden.</div></div>');
+        exit;
+    }
 }
 
 function envQuote(string $v): string
@@ -594,8 +924,6 @@ if ($uri === '/webhooks/twilio/voice/voicemail' && $method === 'POST') {
         ]);
 
     try {
-        $stmt = $pdo->query("SELECT email FROM users WHERE role = 'admin'");
-        $admins = $stmt->fetchAll();
         $recSid = '';
         if ($recUrl !== '') {
             if (preg_match('/\/Recordings\/(RE[a-zA-Z0-9]+)/', $recUrl, $m)) {
@@ -603,16 +931,12 @@ if ($uri === '/webhooks/twilio/voice/voicemail' && $method === 'POST') {
             }
         }
         $recLink = $recSid !== '' ? (baseUrl() . '/api/voice/recording?sid=' . rawurlencode($recSid)) : '';
-        if ($recLink !== '' && is_array($admins)) {
+        if ($recLink !== '') {
             $subject = 'Voicemail from ' . ($from !== '' ? $from : 'Unknown');
             $when = date('c');
-            $body = "You have a new voicemail.\n\nFrom: {$from}\nTo: {$to}\nTime: {$when}\nCallSid: {$callSid}\nRecording: {$recLink}\n";
-            foreach ($admins as $a) {
-                $toEmail = (string) (($a['email'] ?? '') ?: '');
-                if ($toEmail !== '') {
-                    sendEmail($pdo, $toEmail, $subject, $body);
-                }
-            }
+            $emailBody = "You have a new voicemail.\n\nFrom: {$from}\nTo: {$to}\nTime: {$when}\nCallSid: {$callSid}\nRecording: {$recLink}\n";
+            $refKey = ($recSid !== '' ? ('vm:' . $recSid) : ('vm_call:' . $callSid));
+            sendRoleNotification($pdo, 'voice.voicemail', $refKey, $subject, $emailBody, null, null);
         }
     } catch (\Throwable $e) {
     }
@@ -769,7 +1093,6 @@ if ($uri === '/webhooks/twilio/voice' && $method === 'POST') {
 if ($uri === '/api/voice/record-start' && $method === 'POST') {
     Auth::requireLogin();
     $pdo = getPdo($rootDir);
-
     $data = json_decode((string) file_get_contents('php://input'), true);
     if (!is_array($data)) {
         json(['error' => 'Invalid JSON'], 400);
@@ -902,7 +1225,7 @@ if ($uri === '/api/voice/recording' && $method === 'GET') {
     }
 
     if ($isVoicemail) {
-        requireAdmin($pdo);
+        requirePermission($pdo, 'voicemails.view');
     }
 
     $recordingUrl = trim((string) (($row['recording_url'] ?? '') ?: ''));
@@ -1050,6 +1373,15 @@ if ($uri === '/webhooks/twilio/sms' && $method === 'POST') {
     $sid = (string)($_POST['MessageSid'] ?? '');
     $status = (string)($_POST['SmsStatus'] ?? ($_POST['MessageStatus'] ?? 'received'));
 
+    $optEnabled = appSettingGet($pdo, 'sms_opt_out_enabled', '1') === '1';
+    $cmd = strtoupper(trim(preg_replace('/\s+/', ' ', $body)));
+    if ($optEnabled && $from !== '' && in_array($cmd, ['STOP', 'STOPALL', 'UNSUBSCRIBE', 'CANCEL', 'END', 'QUIT'], true)) {
+        $pdo->prepare('INSERT IGNORE INTO sms_opt_outs (phone_number) VALUES (:pn)')->execute([':pn' => $from]);
+    }
+    if ($optEnabled && $from !== '' && in_array($cmd, ['START', 'YES', 'UNSTOP'], true)) {
+        $pdo->prepare('DELETE FROM sms_opt_outs WHERE phone_number = :pn')->execute([':pn' => $from]);
+    }
+
     if ($from !== '' && $to !== '') {
         $contactId = getOrCreateContactId($pdo, $from);
         $defaultNumberId = getOrCreateNumberId($pdo, $to);
@@ -1066,7 +1398,37 @@ if ($uri === '/webhooks/twilio/sms' && $method === 'POST') {
                 ':sid' => ($sid !== '' ? $sid : null),
                 ':st' => ($status !== '' ? $status : 'received'),
             ]);
+        $msgId = null;
+        try {
+            $msgId = (int) $pdo->lastInsertId();
+        } catch (\Throwable $e) {
+            $msgId = null;
+        }
+
+        try {
+            $numMedia = (int) ($_POST['NumMedia'] ?? 0);
+            if ($msgId !== null && $msgId > 0 && $numMedia > 0) {
+                $ins = $pdo->prepare('INSERT INTO message_media (message_id, url, content_type) VALUES (:mid, :url, :ct)');
+                for ($i = 0; $i < $numMedia; $i++) {
+                    $u = trim((string) ($_POST['MediaUrl' . (string) $i] ?? ''));
+                    $ct = trim((string) ($_POST['MediaContentType' . (string) $i] ?? ''));
+                    if ($u !== '') {
+                        $ins->execute([':mid' => $msgId, ':url' => $u, ':ct' => ($ct !== '' ? $ct : null)]);
+                    }
+                }
+            }
+        } catch (\Throwable $e) {
+        }
         updateConversationPreview($pdo, $conversationId, $body);
+
+        try {
+            $subject = 'New SMS from ' . ($from !== '' ? $from : 'Unknown');
+            $when = date('c');
+            $emailBody = "You have a new inbound SMS.\n\nFrom: {$from}\nTo: {$to}\nTime: {$when}\n\nMessage:\n{$body}\n";
+            $refKey = ($sid !== '' ? ('sms:' . $sid) : ('sms_conv:' . (string) $conversationId . ':' . sha1($body)));
+            sendRoleNotification($pdo, 'sms.inbound', $refKey, $subject, $emailBody, (int) $conversationId, $msgId !== null && $msgId > 0 ? (int) $msgId : null);
+        } catch (\Throwable $e) {
+        }
     }
 
     http_response_code(204);
@@ -1250,6 +1612,9 @@ function requireAdmin(PDO $pdo): void
     if ($uid === null) {
         json(['error' => 'Not authenticated'], 401);
     }
+    if (userHasPermission($pdo, $uid, 'settings.manage')) {
+        return;
+    }
     $stmt = $pdo->prepare('SELECT role FROM users WHERE id = :id LIMIT 1');
     $stmt->execute([':id' => $uid]);
     $role = (string) (($stmt->fetch()['role'] ?? '') ?: '');
@@ -1262,95 +1627,6 @@ function requireAdmin(PDO $pdo): void
         render('Forbidden', '<div class="topbar"><div class="brand">VOLTS CONNECT</div></div><div class="card"><h2 style="margin:0 0 8px 0">403</h2><div class="small">Admin only.</div></div>');
         exit;
     }
-}
-
-if ($uri === '/api/admin/settings/smtp' && $method === 'GET') {
-    Auth::requireLogin();
-    $pdo = getPdo($rootDir);
-    requireAdmin($pdo);
-
-    json([
-        'smtp_enabled' => appSettingGet($pdo, 'smtp_enabled', '0') === '1',
-        'smtp_host' => appSettingGet($pdo, 'smtp_host', ''),
-        'smtp_port' => (int) appSettingGet($pdo, 'smtp_port', '587'),
-        'smtp_username' => appSettingGet($pdo, 'smtp_username', ''),
-        'smtp_secure' => appSettingGet($pdo, 'smtp_secure', 'tls'),
-        'smtp_from_email' => appSettingGet($pdo, 'smtp_from_email', ''),
-        'smtp_from_name' => appSettingGet($pdo, 'smtp_from_name', ''),
-        'has_password' => appSettingGet($pdo, 'smtp_password_enc', '') !== '',
-    ]);
-}
-
-if ($uri === '/api/admin/settings/smtp' && $method === 'POST') {
-    Auth::requireLogin();
-    $pdo = getPdo($rootDir);
-    requireAdmin($pdo);
-
-    $payload = json_decode((string) file_get_contents('php://input'), true);
-    if (!is_array($payload)) {
-        json(['error' => 'Invalid JSON'], 400);
-    }
-
-    $enabled = !empty($payload['smtp_enabled']) ? '1' : '0';
-    $host = trim((string) ($payload['smtp_host'] ?? ''));
-    $port = (int) ($payload['smtp_port'] ?? 587);
-    if ($port <= 0) {
-        $port = 587;
-    }
-    $user = trim((string) ($payload['smtp_username'] ?? ''));
-    $pass = (string) ($payload['smtp_password'] ?? '');
-    $secure = trim((string) ($payload['smtp_secure'] ?? 'tls'));
-    if (!in_array($secure, ['tls', 'ssl', 'none'], true)) {
-        $secure = 'tls';
-    }
-    $fromEmail = trim((string) ($payload['smtp_from_email'] ?? ''));
-    $fromName = trim((string) ($payload['smtp_from_name'] ?? ''));
-
-    appSettingSet($pdo, 'smtp_enabled', $enabled);
-    appSettingSet($pdo, 'smtp_host', $host);
-    appSettingSet($pdo, 'smtp_port', (string) $port);
-    appSettingSet($pdo, 'smtp_username', $user);
-    appSettingSet($pdo, 'smtp_secure', $secure);
-    appSettingSet($pdo, 'smtp_from_email', $fromEmail);
-    appSettingSet($pdo, 'smtp_from_name', $fromName);
-
-    if (trim($pass) !== '') {
-        appSettingSet($pdo, 'smtp_password_enc', encryptSecret($pass));
-    }
-
-    json(['ok' => true]);
-}
-
-if ($uri === '/api/admin/settings/smtp/test' && $method === 'POST') {
-    Auth::requireLogin();
-    $pdo = getPdo($rootDir);
-    requireAdmin($pdo);
-
-    $enabled = appSettingGet($pdo, 'smtp_enabled', '0') === '1';
-    if (!$enabled) {
-        json(['error' => 'Enable SMTP first'], 400);
-    }
-    $host = trim(appSettingGet($pdo, 'smtp_host', ''));
-    if ($host === '') {
-        json(['error' => 'SMTP host is required'], 400);
-    }
-
-    $payload = json_decode((string) file_get_contents('php://input'), true);
-    if (!is_array($payload)) {
-        json(['error' => 'Invalid JSON'], 400);
-    }
-    $toEmail = trim((string) ($payload['to_email'] ?? ''));
-    if ($toEmail === '' || filter_var($toEmail, FILTER_VALIDATE_EMAIL) === false) {
-        json(['error' => 'Enter a valid test email address'], 400);
-    }
-
-    $subject = 'VOLTS CONNECT test email';
-    $body = "This is a test email from VOLTS CONNECT.\n\nIf you received this, your SMTP settings are working.";
-    $ok = sendEmail($pdo, $toEmail, $subject, $body);
-    if (!$ok) {
-        json(['error' => 'Failed to send test email'], 500);
-    }
-    json(['ok' => true]);
 }
 
 if ($uri === '/login' && $method === 'GET') {
@@ -1671,9 +1947,9 @@ if ($uri === '/app' && $method === 'GET') {
 
     $content = '<div class="appShell">';
     $content .= '<header class="appTop">';
-    $content .= '<div class="brand"><img class="brandLogo brandLogoDark" src="/assets/img/logo-dark.svg" alt="Logo"><img class="brandLogo brandLogoLight" src="/assets/img/logo-light.svg" alt="Logo">VOLTS CONNECT</div>';
+    $content .= '<div class="brand"><img class="brandLogo brandLogoDark" src="/assets/img/logo-dark.svg" alt="Logo"><img class="brandLogo brandLogoLight" src="/assets/img/logo-light.svg" alt="Logo">VOLTS CONNECT <span class="small" style="margin-left:6px">WEB - Twilio</span></div>';
     $content .= '<div class="topActions">';
-    $content .= '<button class="btn" type="button" id="themeToggle">Theme</button>';
+    $content .= '<button class="btn" type="button" id="themeToggle"><span id="themeToggleIcon" aria-hidden="true"></span><span id="themeToggleLabel">Theme</span></button>';
     $content .= '<form method="post" action="/logout" style="margin:0"><button class="btn danger" type="submit">Logout</button></form>';
     $content .= '</div>';
     $content .= '</header>';
@@ -1682,18 +1958,34 @@ if ($uri === '/app' && $method === 'GET') {
 
     $content .= '<aside class="nav">';
     $content .= '<div class="navTitle">Menu</div>';
-    $content .= '<a class="navItem active" href="#inbox" id="navInbox">Inbox</a>';
-    $content .= '<a class="navItem" href="#dialpad" id="navDialpad">Dial Pad</a>';
+    $content .= '<nav class="nav">';
+    $content .= '<a class="navItem" href="#analytics" id="navAnalytics">Analytics</a>';
+    $content .= '<a class="navItem" href="#inbox" id="navInbox" style="position:relative">Inbox<span id="navInboxDot" style="display:none;position:absolute;top:10px;right:10px;width:8px;height:8px;border-radius:999px;background:#ff5b6b"></span></a>';
+    $content .= '<a class="navItem" href="#dialpad" id="navDialpad">Dialpad</a>';
     $content .= '<a class="navItem" href="#calls" id="navCalls">Calls</a>';
     $content .= '<a class="navItem" href="#voicemails" id="navVoicemails">Voicemails</a>';
     $content .= '<a class="navItem" href="#contacts" id="navContacts">Contacts</a>';
+    $content .= '<a class="navItem" href="#broadcast" id="navBroadcast">Broadcast</a>';
     $content .= '<a class="navItem" href="#numbers" id="navNumbers">Numbers</a>';
     $content .= '<a class="navItem" href="#settings" id="navSettings">Settings</a>';
     $content .= '<a class="navItem" href="#users" id="navUsers">Users</a>';
+    $content .= '<a class="navItem" href="#roles" id="navRoles">Roles</a>';
     $content .= '<div class="navSpacer"></div>';
     $content .= '</aside>';
 
-    $content .= '<section class="view" id="viewInbox">';
+    $content .= '<section class="view" id="viewAnalytics">';
+    $content .= '<div class="pageHeader"><div class="pageTitle">Analytics</div><div class="small">Quick analytics</div></div>';
+    $content .= '<div class="card" style="margin-top:12px">';
+    $content .= '<div class="row" style="align-items:center;justify-content:space-between">';
+    $content .= '<div class="small">Overview</div>';
+    $content .= '<button class="btn" type="button" id="refreshAnalytics">Refresh</button>';
+    $content .= '</div>';
+    $content .= '<div style="height:12px"></div>';
+    $content .= '<div id="analyticsQuick"></div>';
+    $content .= '</div>';
+    $content .= '</section>';
+
+    $content .= '<section class="view" id="viewInbox" style="display:none">';
     $content .= '<div class="inboxGrid">';
 
     $content .= '<aside class="sidebar">';
@@ -1702,7 +1994,7 @@ if ($uri === '/app' && $method === 'GET') {
     $content .= '<div class="small" id="convCount"></div>';
     $content .= '</div>';
     $content .= '<div style="height:10px"></div>';
-    $content .= '<input class="input" id="searchInput" placeholder="Search contacts or numbers">';
+    $content .= '<input class="input" id="searchInput" placeholder="Search contacts or numbers" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false">';
     $content .= '<div style="height:10px"></div>';
     $content .= '<div class="row">';
     $content .= '<button class="btn" type="button" id="filterAll">All</button>';
@@ -1730,9 +2022,6 @@ if ($uri === '/app' && $method === 'GET') {
     $content .= '<div class="chatTitle" id="chatTitle">Select a conversation</div>';
     $content .= '<div class="small" id="chatSub"></div>';
     $content .= '</div>';
-    $content .= '<div class="chatMeta">';
-    $content .= '<div class="small">Voice: <span id="voiceStatus">Loading...</span></div>';
-    $content .= '</div>';
     $content .= '</div>';
 
     $content .= '<div class="incomingBar" id="incomingBox" style="display:none">';
@@ -1748,12 +2037,20 @@ if ($uri === '/app' && $method === 'GET') {
     $content .= '<div class="composer">';
     $content .= '<div class="row" style="align-items:center">';
     $content .= '<select class="input" id="fromNumberSelect" style="max-width:260px"></select>';
+    $content .= '<select class="input" id="inboxTemplate" style="max-width:260px"></select>';
     $content .= '</div>';
     $content .= '<div style="height:10px"></div>';
     $content .= '<div class="row" style="align-items:flex-end">';
     $content .= '<textarea class="input" id="messageBody" placeholder="Write a message" rows="2" style="resize:none;flex:1"></textarea>';
     $content .= '<button class="btn primary" type="button" id="sendBtn">Send</button>';
     $content .= '</div>';
+    $content .= '<div class="row" style="align-items:center;margin-top:8px">';
+    $content .= '<button class="btn" type="button" id="mmsPickBtn">Attach</button>';
+    $content .= '<button class="btn" type="button" id="mmsClearBtn" style="display:none">Remove</button>';
+    $content .= '<div class="small" id="mmsPickedLabel" style="display:none"></div>';
+    $content .= '<input type="file" id="mmsFileInput" style="display:none" accept="image/*,video/*,audio/*,application/pdf">';
+    $content .= '</div>';
+    $content .= '<div class="small" id="inboxSmsCounter" style="margin-top:6px"></div>';
     $content .= '</div>';
 
     $content .= '</section>';
@@ -1764,14 +2061,53 @@ if ($uri === '/app' && $method === 'GET') {
     $content .= '<button class="btn" type="button" id="rightClose">Close</button>';
     $content .= '</div>';
     $content .= '<div class="card" style="margin-top:12px">';
-    $content .= '<div class="small">Name</div>';
-    $content .= '<input class="input" id="contactName" placeholder="Contact name">';
+    $content .= '<button class="btn" type="button" id="inboxEditOpen">Edit details</button>';
+    $content .= '</div>';
+
+    $content .= '<div class="card" style="margin-top:12px">';
+    $content .= '<div class="small">Chat notes</div>';
+    $content .= '<div class="notes" id="chatNotesList" style="margin-top:10px"></div>';
+    $content .= '<div style="height:10px"></div>';
+    $content .= '<textarea class="input" id="chatNoteBody" placeholder="Add a chat note" rows="2" style="resize:none"></textarea>';
+    $content .= '<div style="height:10px"></div>';
+    $content .= '<button class="btn primary" type="button" id="addChatNote">Add chat note</button>';
+    $content .= '</div>';
+
+    $content .= '</aside>';
+
+    $content .= '<div class="incomingModal" id="inboxEditModal" style="display:none">';
+    $content .= '<div class="incomingCard" style="width:min(720px,calc(100vw - 28px))">';
+    $content .= '<div class="row inboxEditHeader" style="align-items:center;justify-content:space-between">';
+    $content .= '<div class="incomingTitle">Edit contact</div>';
+    $content .= '<div class="row">';
+    $content .= '<button class="btn" type="button" id="inboxEditSaveTop">Save</button>';
+    $content .= '<button class="btn" type="button" id="inboxEditClose">Close</button>';
+    $content .= '</div>';
+    $content .= '</div>';
+
+    $content .= '<div class="card" style="margin-top:12px">';
+    $content .= '<div class="small">First name</div>';
+    $content .= '<input class="input" id="contactFirstName" placeholder="First name">';
+    $content .= '<div style="height:10px"></div>';
+    $content .= '<div class="small">Last name</div>';
+    $content .= '<input class="input" id="contactLastName" placeholder="Last name">';
+    $content .= '<div style="height:10px"></div>';
+    $content .= '<div class="small">Display name</div>';
+    $content .= '<input class="input" id="contactName" placeholder="Company / display name">';
+    $content .= '<div style="height:10px"></div>';
+    $content .= '<div class="small">Email</div>';
+    $content .= '<input class="input" id="contactEmail" placeholder="email@domain.com">';
     $content .= '<div style="height:10px"></div>';
     $content .= '<div class="small">Phone</div>';
     $content .= '<div id="contactPhone" class="small" style="margin-top:6px"></div>';
     $content .= '<div class="small" id="conversationToNumber" style="margin-top:8px"></div>';
     $content .= '<div style="height:12px"></div>';
-    $content .= '<button class="btn" type="button" id="saveContact">Save</button>';
+    $content .= '</div>';
+
+    $content .= '<div class="card" style="margin-top:12px">';
+    $content .= '<div class="small">Custom fields</div>';
+    $content .= '<div id="inboxContactFields" style="margin-top:10px"></div>';
+    $content .= '<div style="height:10px"></div>';
     $content .= '</div>';
 
     $content .= '<div class="card" style="margin-top:12px">';
@@ -1785,15 +2121,16 @@ if ($uri === '/app' && $method === 'GET') {
     $content .= '</div>';
 
     $content .= '<div class="card" style="margin-top:12px">';
-    $content .= '<div class="small">Notes</div>';
-    $content .= '<div class="notes" id="notesList" style="margin-top:10px"></div>';
+    $content .= '<div class="small">Contact notes</div>';
+    $content .= '<div class="notes" id="contactNotesListModal" style="margin-top:10px"></div>';
     $content .= '<div style="height:10px"></div>';
-    $content .= '<textarea class="input" id="noteBody" placeholder="Add a note" rows="2" style="resize:none"></textarea>';
+    $content .= '<textarea class="input" id="contactNoteBodyModal" placeholder="Add a contact note" rows="2" style="resize:none"></textarea>';
     $content .= '<div style="height:10px"></div>';
-    $content .= '<button class="btn primary" type="button" id="addNote">Add note</button>';
+    $content .= '<button class="btn primary" type="button" id="addContactNoteModal">Add contact note</button>';
     $content .= '</div>';
 
-    $content .= '</aside>';
+    $content .= '</div>';
+    $content .= '</div>';
 
     $content .= '</div>';
     $content .= '</section>';
@@ -1804,6 +2141,52 @@ if ($uri === '/app' && $method === 'GET') {
     $content .= '<div class="row" style="align-items:center;justify-content:space-between">';
     $content .= '<div class="small">Latest calls</div>';
     $content .= '<button class="btn" type="button" id="refreshCalls">Refresh</button>';
+    $content .= '</div>';
+    $content .= '<div style="height:12px"></div>';
+    $content .= '<div class="row" style="align-items:flex-end;flex-wrap:wrap">';
+    $content .= '<div style="min-width:220px;flex:1">';
+    $content .= '<div class="small" style="margin-bottom:6px">Search</div>';
+    $content .= '<input class="input" id="callsSearch" placeholder="From, To, user email, SID...">';
+    $content .= '</div>';
+    $content .= '<div style="min-width:160px">';
+    $content .= '<div class="small" style="margin-bottom:6px">Direction</div>';
+    $content .= '<select class="input" id="callsDirection">'
+        . '<option value="">All</option>'
+        . '<option value="inbound">Inbound</option>'
+        . '<option value="outbound">Outbound</option>'
+        . '</select>';
+    $content .= '</div>';
+    $content .= '<div style="min-width:160px">';
+    $content .= '<div class="small" style="margin-bottom:6px">Status</div>';
+    $content .= '<input class="input" id="callsStatus" placeholder="e.g. completed">';
+    $content .= '</div>';
+    $content .= '<div style="min-width:220px">';
+    $content .= '<div class="small" style="margin-bottom:6px">User</div>';
+    $content .= '<select class="input" id="callsUser">'
+        . '<option value="">All</option>'
+        . '</select>';
+    $content .= '</div>';
+    $content .= '<div style="min-width:160px">';
+    $content .= '<div class="small" style="margin-bottom:6px">From</div>';
+    $content .= '<input class="input" id="callsFromDate" type="date">';
+    $content .= '</div>';
+    $content .= '<div style="min-width:160px">';
+    $content .= '<div class="small" style="margin-bottom:6px">To</div>';
+    $content .= '<input class="input" id="callsToDate" type="date">';
+    $content .= '</div>';
+    $content .= '<div class="row">';
+    $content .= '<button class="btn" type="button" id="applyCallsFilters">Apply</button>';
+    $content .= '<button class="btn" type="button" id="resetCallsFilters">Reset</button>';
+    $content .= '</div>';
+    $content .= '</div>';
+    $content .= '<div style="height:12px"></div>';
+    $content .= '<div class="row" style="align-items:center;justify-content:space-between;flex-wrap:wrap">';
+    $content .= '<div class="small" id="callsSelectedCount">0 selected</div>';
+    $content .= '<div class="row">';
+    $content .= '<button class="btn" type="button" id="callsSelectAllVisible">Select all visible</button>';
+    $content .= '<button class="btn" type="button" id="callsClearSelection">Clear</button>';
+    $content .= '<button class="btn danger" type="button" id="callsBulkDelete">Delete selected</button>';
+    $content .= '</div>';
     $content .= '</div>';
     $content .= '<div style="height:12px"></div>';
     $content .= '<div class="list" id="callsList"></div>';
@@ -1818,6 +2201,15 @@ if ($uri === '/app' && $method === 'GET') {
     $content .= '<button class="btn" type="button" id="refreshVoicemailsMain">Refresh</button>';
     $content .= '</div>';
     $content .= '<div style="height:12px"></div>';
+    $content .= '<div class="row" style="align-items:center;justify-content:space-between;flex-wrap:wrap">';
+    $content .= '<div class="small" id="voicemailsSelectedCount">0 selected</div>';
+    $content .= '<div class="row">';
+    $content .= '<button class="btn" type="button" id="voicemailsSelectAllVisible">Select all visible</button>';
+    $content .= '<button class="btn" type="button" id="voicemailsClearSelection">Clear</button>';
+    $content .= '<button class="btn danger" type="button" id="voicemailsBulkDelete">Delete selected</button>';
+    $content .= '</div>';
+    $content .= '</div>';
+    $content .= '<div style="height:12px"></div>';
     $content .= '<div class="list" id="voicemailsListMain"></div>';
     $content .= '</div>';
     $content .= '</section>';
@@ -1829,7 +2221,7 @@ if ($uri === '/app' && $method === 'GET') {
     $content .= '<div class="small" style="margin-bottom:8px">Voice status: <span id="voiceStatus2">Loading...</span></div>';
     $content .= '<select class="input" id="dialFromNumberSelect" style="max-width:260px"></select>';
     $content .= '<div style="height:10px"></div>';
-    $content .= '<input class="input" id="dialInput" placeholder="+1..." inputmode="tel">';
+    $content .= '<input class="input" id="dialInput" placeholder="+1..." inputmode="tel" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false">';
     $content .= '<div class="dial">';
     foreach (["1","2","3","4","5","6","7","8","9","*","0","#"] as $k) {
         $content .= '<button class="key" type="button" data-k="' . h($k) . '">' . h($k) . '</button>';
@@ -1837,19 +2229,72 @@ if ($uri === '/app' && $method === 'GET') {
     $content .= '</div>';
     $content .= '<div style="height:12px"></div>';
     $content .= '<div class="row">';
-    $content .= '<button class="btn primary" type="button" id="callBtn">Call</button>';
+    $content .= '<button class="btn primary" type="button" id="callBtn"><span aria-hidden="true" style="display:inline-flex;align-items:center">'
+        . '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M6.6 10.8c1.5 3 3.6 5.1 6.6 6.6l2.2-2.2c.3-.3.8-.4 1.2-.2 1 .4 2.2.6 3.4.6.7 0 1.3.6 1.3 1.3V20c0 .7-.6 1.3-1.3 1.3C10.4 21.3 2.7 13.6 2.7 4c0-.7.6-1.3 1.3-1.3h3.6c.7 0 1.3.6 1.3 1.3 0 1.2.2 2.3.6 3.4.1.4 0 .9-.3 1.2L6.6 10.8z" fill="currentColor"/></svg>'
+        . '</span> <span>Call</span></button>';
     $content .= '<button class="btn" type="button" id="clearBtn">Clear</button>';
     $content .= '</div>';
     $content .= '</div>';
     $content .= '<div class="card">';
-    $content .= '<div class="small">Tip</div>';
-    $content .= '<div style="margin-top:8px">Check Settings for webhook URLs and configuration.</div>';
+    $content .= '<div class="row" style="align-items:center;justify-content:space-between">';
+    $content .= '<div class="small">Quick analytics</div>';
+    $content .= '<button class="btn" type="button" id="refreshDialpadAnalytics">Refresh</button>';
+    $content .= '</div>';
+    $content .= '<div style="height:12px"></div>';
+    $content .= '<div id="dialpadAnalytics"></div>';
     $content .= '</div>';
     $content .= '</div>';
     $content .= '</section>';
 
     $content .= '<section class="view" id="viewSettings" style="display:none">';
-    $content .= '<div class="pageHeader"><div class="pageTitle">Settings</div><div class="small">Migrations and configuration</div></div>';
+    $content .= '<div class="pageHeader"><div class="pageTitle">Settings</div><div class="small">Configuration</div></div>';
+
+    $content .= '<div class="row" id="settingsTabs" style="margin-top:12px;gap:8px;flex-wrap:wrap">';
+    $content .= '<button class="btn" type="button" data-stab="twilio">Twilio</button>';
+    $content .= '<button class="btn" type="button" data-stab="email">Email</button>';
+    $content .= '<button class="btn" type="button" data-stab="voice">Voice</button>';
+    $content .= '<button class="btn" type="button" data-stab="general">General</button>';
+    $content .= '<button class="btn" type="button" data-stab="automations">Automations</button>';
+    $content .= '<button class="btn" type="button" data-stab="custom_fields">Custom Fields</button>';
+    $content .= '</div>';
+
+    $content .= '<div id="settingsSectionCustomFields" class="settingsSection" data-stab="custom_fields" style="display:none">';
+
+    $content .= '<div class="card" style="margin-top:12px">';
+    $content .= '<div class="small" style="margin-bottom:10px">Tags</div>';
+    $content .= '<div class="row">';
+    $content .= '<input class="input" id="newTagName" placeholder="New tag name" style="flex:1">';
+    $content .= '<button class="btn primary" type="button" id="addTagBtn">Add</button>';
+    $content .= '</div>';
+    $content .= '<div style="height:12px"></div>';
+    $content .= '<div class="list" id="tagsList"></div>';
+    $content .= '</div>';
+
+    $content .= '<div class="card" style="margin-top:12px">';
+    $content .= '<div class="small" style="margin-bottom:10px">Groups</div>';
+    $content .= '<div class="row">';
+    $content .= '<input class="input" id="newGroupName" placeholder="New group name" style="flex:1">';
+    $content .= '<button class="btn primary" type="button" id="addGroupBtn">Add</button>';
+    $content .= '</div>';
+    $content .= '<div style="height:12px"></div>';
+    $content .= '<div class="list" id="groupsList"></div>';
+    $content .= '</div>';
+
+    $content .= '<div class="card" id="contactFieldsAdminCard" style="display:none">';
+    $content .= '<div class="small" style="margin-bottom:10px">Custom fields</div>';
+    $content .= '<div class="row">';
+    $content .= '<input class="input" id="newContactFieldKey" placeholder="field_key (e.g. first_name)" style="flex:1">';
+    $content .= '<input class="input" id="newContactFieldLabel" placeholder="Label (e.g. First name)" style="flex:1">';
+    $content .= '<button class="btn primary" type="button" id="addContactFieldBtn">Add</button>';
+    $content .= '</div>';
+    $content .= '<div style="height:12px"></div>';
+    $content .= '<div class="list" id="contactFieldsList"></div>';
+    $content .= '<div class="small" style="margin-top:10px">Default tags: {first_name} {last_name} {email} {phone_number}. Custom fields: {field_key}</div>';
+    $content .= '</div>';
+
+    $content .= '</div>';
+
+    $content .= '<div id="settingsSectionTwilio" class="settingsSection" data-stab="twilio">';
 
     $content .= '<div class="card">';
     $content .= '<div class="row" style="align-items:center;justify-content:space-between">';
@@ -1896,6 +2341,10 @@ if ($uri === '/app' && $method === 'GET') {
     $content .= '<div class="small" style="margin-top:10px">Used when a number does not have an account profile selected.</div>';
     $content .= '</div>';
 
+    $content .= '</div>';
+
+    $content .= '<div id="settingsSectionEmail" class="settingsSection" data-stab="email" style="display:none">';
+
     $content .= '<div class="card" style="margin-top:12px">';
     $content .= '<div class="row" style="align-items:center;justify-content:space-between">';
     $content .= '<div class="small">SMTP email</div>';
@@ -1932,6 +2381,88 @@ if ($uri === '/app' && $method === 'GET') {
     $content .= '</div>';
     $content .= '<div class="small" style="margin-top:10px">Notifications sent: Voicemail alerts (sent to all admin users). Password is stored encrypted in the database.</div>';
     $content .= '</div>';
+    $content .= '</div>';
+    $content .= '<div id="settingsSectionGeneral" class="settingsSection" data-stab="general" style="display:none">';
+    $content .= '<div class="card" style="margin-top:12px">';
+    $content .= '<div class="row" style="align-items:center;justify-content:space-between">';
+    $content .= '<div class="small">Webhooks</div>';
+    $content .= '<button class="btn" type="button" id="showWebhooksInfo">i</button>';
+    $content .= '</div>';
+    $content .= '<div style="height:12px"></div>';
+    $content .= '<div class="small" style="margin-bottom:6px">SMS webhook (incoming)</div>';
+    $content .= '<input class="input" id="twilioSmsWebhookUrl" name="twilioSmsWebhookUrl" readonly value="' . h(baseUrl() . '/webhooks/twilio/sms') . '" onclick="this.select()">';
+    $content .= '<div style="height:10px"></div>';
+    $content .= '<div class="small" style="margin-bottom:6px">SMS status callback (delivery receipts)</div>';
+    $content .= '<input class="input" id="twilioSmsStatusCallbackUrl" name="twilioSmsStatusCallbackUrl" readonly value="' . h(baseUrl() . '/webhooks/twilio/sms/status') . '" onclick="this.select()">';
+    $content .= '<div style="height:10px"></div>';
+    $content .= '<div class="small" style="margin-bottom:6px">Voice webhook (TwiML App Voice URL)</div>';
+    $content .= '<input class="input" id="twilioVoiceWebhookUrl" name="twilioVoiceWebhookUrl" readonly value="' . h(baseUrl() . '/webhooks/twilio/voice') . '" onclick="this.select()">';
+    $content .= '<div style="height:10px"></div>';
+    $content .= '<div class="small" style="margin-bottom:6px">Voice status callback</div>';
+    $content .= '<input class="input" id="twilioVoiceStatusCallbackUrl" name="twilioVoiceStatusCallbackUrl" readonly value="' . h(baseUrl() . '/webhooks/twilio/voice/status') . '" onclick="this.select()">';
+    $content .= '</div>';
+
+    $content .= '<div class="card" style="margin-top:12px">';
+    $content .= '<div class="row" style="align-items:center;justify-content:space-between">';
+    $content .= '<div class="small">Timezone</div>';
+    $content .= '<div class="row">';
+    $content .= '<button class="btn" type="button" id="refreshTimezone">Refresh</button>';
+    $content .= '<button class="btn primary" type="button" id="saveTimezone">Save</button>';
+    $content .= '</div>';
+    $content .= '</div>';
+    $content .= '<div style="height:12px"></div>';
+    $content .= '<select class="input" id="appTimezone"></select>';
+    $content .= '<div class="small" style="margin-top:10px">Used for scheduling campaigns and displaying times.</div>';
+    $content .= '<div class="small" style="margin-top:6px">Current time: <span id="timezoneNow"></span></div>';
+    $content .= '</div>';
+
+    $content .= '<div class="card" style="margin-top:12px">';
+    $content .= '<div class="small" style="margin-bottom:10px">Database</div>';
+    $content .= '<a class="btn" href="/migrate" target="_blank">Run migration</a>';
+    $content .= '<div class="small" style="margin-top:10px">Only run after an update, when instructed.</div>';
+    $content .= '</div>';
+
+    $content .= '</div>';
+
+    $content .= '<div id="settingsSectionAutomations" class="settingsSection" data-stab="automations" style="display:none">';
+    $content .= '<div class="card" style="margin-top:12px">';
+    $content .= '<div class="row" style="align-items:center;justify-content:space-between">';
+    $content .= '<div class="small">SMS opt-out (STOP)</div>';
+    $content .= '<div class="row">';
+    $content .= '<button class="btn" type="button" id="refreshOptOut">Refresh</button>';
+    $content .= '<button class="btn primary" type="button" id="saveOptOut">Save</button>';
+    $content .= '</div>';
+    $content .= '</div>';
+    $content .= '<div style="height:12px"></div>';
+    $content .= '<label class="small" style="display:block;margin-bottom:10px"><input type="checkbox" id="smsOptOutEnabled"> Enable STOP/START opt-out automation</label>';
+    $content .= '<div class="small">Keywords: STOP, STOPALL, UNSUBSCRIBE, CANCEL, END, QUIT to opt out. START, YES, UNSTOP to opt back in.</div>';
+    $content .= '</div>';
+
+    $content .= '<div class="card" style="margin-top:12px">';
+    $content .= '<div class="row" style="align-items:center;justify-content:space-between">';
+    $content .= '<div class="small">Notification rules</div>';
+    $content .= '<button class="btn" type="button" id="refreshNotifRules">Refresh</button>';
+    $content .= '</div>';
+    $content .= '<div style="height:12px"></div>';
+    $content .= '<div class="small">Role</div>';
+    $content .= '<select class="input" id="notifRoleSelect"></select>';
+    $content .= '<div style="height:10px"></div>';
+    $content .= '<div class="small" style="margin-bottom:10px">Events</div>';
+    $content .= '<div class="list" id="notifEventsList"></div>';
+    $content .= '<div style="height:12px"></div>';
+    $content .= '<button class="btn primary" type="button" id="notifSaveRule">Save</button>';
+    $content .= '<div class="small" style="margin-top:10px">Reminder cron: call /api/cron/notifications?token=YOUR_TOKEN (token stored in app_settings: notify_cron_token)</div>';
+    $content .= '</div>';
+
+    $content .= '<div class="card" style="margin-top:12px">';
+    $content .= '<div class="small" style="margin-bottom:10px">Inbox notifications</div>';
+    $content .= '<label class="small" style="display:block;margin-bottom:10px"><input type="checkbox" id="smsNotifySound"> Play sound for new SMS</label>';
+    $content .= '<label class="small" style="display:block;margin-bottom:10px"><input type="checkbox" id="smsNotifyDesktop"> Desktop notification for new SMS</label>';
+    $content .= '<div class="small">Desktop notifications require browser permission.</div>';
+    $content .= '</div>';
+    $content .= '</div>';
+
+    $content .= '<div id="settingsSectionVoice" class="settingsSection" data-stab="voice" style="display:none">';
 
     $content .= '<div class="card" style="margin-top:12px">';
     $content .= '<div class="row" style="align-items:center;justify-content:space-between">';
@@ -1956,35 +2487,174 @@ if ($uri === '/app' && $method === 'GET') {
     $content .= '<label class="small" style="display:block;margin-bottom:10px"><input type="checkbox" id="voiceRecordCalls"> Record calls (store recording URL)</label>';
     $content .= '<textarea class="input" id="voiceVoicemailGreeting" placeholder="Voicemail greeting" rows="2" style="resize:none"></textarea>';
     $content .= '<div style="height:10px"></div>';
-    $content .= '<input class="input" id="voiceVoicemailMax" placeholder="Voicemail max length seconds (10-300)">';
-    $content .= '</div>';
-    $content .= '</div>';
     $content .= '</div>';
 
-    $content .= '<div class="card" style="margin-top:12px">';
-    $content .= '<div class="row" style="align-items:center;justify-content:space-between">';
-    $content .= '<div class="small">Webhooks</div>';
-    $content .= '<button class="btn" type="button" id="showWebhooksInfo">i</button>';
     $content .= '</div>';
-    $content .= '<div class="small" style="margin-top:10px">SMS: ' . h(baseUrl()) . '/webhooks/twilio/sms</div>';
-    $content .= '<div class="small" style="margin-top:6px">Voice: ' . h(baseUrl()) . '/webhooks/twilio/voice</div>';
     $content .= '</div>';
-
-    $content .= '<div class="card" style="margin-top:12px">';
-    $content .= '<div class="small" style="margin-bottom:10px">Database</div>';
-    $content .= '<a class="btn" href="/migrate" target="_blank">Run migration</a>';
-    $content .= '<div class="small" style="margin-top:10px">Only run after an update, when instructed.</div>';
     $content .= '</div>';
 
     $content .= '</section>';
 
     $content .= '<section class="view" id="viewContacts" style="display:none">';
     $content .= '<div class="pageHeader"><div class="pageTitle">Contacts</div><div class="small">Search and edit contacts</div></div>';
+    $content .= '<div class="card" style="margin-top:12px">';
+    $content .= '<div class="row" style="align-items:center;justify-content:space-between">';
+    $content .= '<input class="input" id="contactsSearch" placeholder="Search name or number" style="flex:1" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false">';
+    $content .= '<select class="input" id="contactsFilterGroup" style="max-width:220px">';
+    $content .= '<option value="">All groups</option>';
+    $content .= '</select>';
+    $content .= '<select class="input" id="contactsFilterTag" style="max-width:220px">';
+    $content .= '<option value="">All tags</option>';
+    $content .= '</select>';
+    $content .= '<div class="row">';
+    $content .= '<button class="btn" type="button" id="exportContactsBtn">Export</button>';
+    $content .= '<button class="btn" type="button" id="importContactsBtn">Import</button>';
+    $content .= '<input type="file" id="importContactsFile" accept=".csv,text/csv" style="display:none">';
+    $content .= '<button class="btn" type="button" id="openAddContactModal">Add contact</button>';
+    $content .= '<button class="btn primary" type="button" id="saveContactsAll">Save all</button>';
+    $content .= '</div>';
+    $content .= '</div>';
+    $content .= '<div style="height:12px"></div>';
+    $content .= '<div class="row" style="align-items:center;justify-content:space-between;flex-wrap:wrap">';
+    $content .= '<div class="small" id="contactsSelectedCount">0 selected</div>';
+    $content .= '<div class="row" style="flex-wrap:wrap;align-items:center;gap:8px;flex:1">';
+    $content .= '<button class="btn" type="button" id="contactsSelectAllVisible">Select all visible</button>';
+    $content .= '<button class="btn" type="button" id="contactsClearSelection">Clear</button>';
+    $content .= '<select class="input" id="contactsBulkGroup" style="max-width:220px"></select>';
+    $content .= '<button class="btn" type="button" id="contactsBulkAddGroup">Add group</button>';
+    $content .= '<select class="input" id="contactsBulkTag" style="max-width:220px"></select>';
+    $content .= '<button class="btn" type="button" id="contactsBulkAddTag">Add tag</button>';
+    $content .= '</div>';
+    $content .= '<button class="btn danger" type="button" id="contactsBulkDelete">Delete selected</button>';
+    $content .= '</div>';
+    $content .= '<div style="height:12px"></div>';
     $content .= '<div class="card">';
-    $content .= '<input class="input" id="contactsSearch" placeholder="Search name or number">';
     $content .= '<div style="height:12px"></div>';
     $content .= '<div class="list" id="contactsList"></div>';
     $content .= '</div>';
+    $content .= '</section>';
+
+    $content .= '<div class="incomingModal" id="addContactModal" style="display:none">';
+    $content .= '<div class="incomingCard" style="width:min(720px,calc(100vw - 28px))">';
+    $content .= '<div class="row" style="align-items:center;justify-content:space-between;position:sticky;top:0;z-index:2;padding-bottom:10px;background:inherit">';
+    $content .= '<div class="incomingTitle">Add contact</div>';
+    $content .= '<button class="btn" type="button" id="closeAddContactModal">Close</button>';
+    $content .= '</div>';
+    $content .= '<div class="card" style="margin-top:12px">';
+    $content .= '<input class="input" id="newContactPhone" placeholder="Phone number (+1...)">';
+    $content .= '<div style="height:10px"></div>';
+    $content .= '<div class="row">';
+    $content .= '<input class="input" id="newContactFirstName" placeholder="First name" style="flex:1">';
+    $content .= '<input class="input" id="newContactLastName" placeholder="Last name" style="flex:1">';
+    $content .= '</div>';
+    $content .= '<div style="height:10px"></div>';
+    $content .= '<div class="row">';
+    $content .= '<input class="input" id="newContactName" placeholder="Display name (optional)" style="flex:1">';
+    $content .= '<input class="input" id="newContactEmail" placeholder="Email" style="flex:1">';
+    $content .= '</div>';
+    $content .= '<div style="height:10px"></div>';
+    $content .= '<button class="btn primary" type="button" id="addContactBtn">Add</button>';
+    $content .= '</div>';
+    $content .= '</div>';
+    $content .= '</div>';
+
+    $content .= '<section class="view" id="viewBroadcast" style="display:none">';
+    $content .= '<div class="pageHeader"><div class="pageTitle">Broadcast</div><div class="small">Bulk messaging (preview first)</div></div>';
+
+    $content .= '<div class="row" id="broadcastTabs" style="margin-top:12px;gap:8px;flex-wrap:wrap">';
+    $content .= '<button class="btn" type="button" data-btab="campaigns">Campaigns</button>';
+    $content .= '<button class="btn" type="button" data-btab="templates">Templates</button>';
+    $content .= '</div>';
+
+    $content .= '<div id="broadcastSectionCampaigns" class="broadcastSection" data-btab="campaigns">';
+    $content .= '<div class="card" style="margin-top:12px">';
+    $content .= '<div class="small" style="margin-bottom:10px">Audience</div>';
+    $content .= '<select class="input" id="broadcastAudienceMode">'
+        . '<option value="all">All contacts</option>'
+        . '<option value="search">Search filter</option>'
+        . '<option value="group">Group</option>'
+        . '<option value="tag">Tag</option>'
+        . '<option value="paste">Paste numbers</option>'
+        . '</select>';
+    $content .= '<div id="broadcastAudienceSearch" style="margin-top:10px;display:none">';
+    $content .= '<input class="input" id="broadcastQuery" placeholder="Search filter (name, number, email)" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false">';
+    $content .= '</div>';
+    $content .= '<div id="broadcastAudienceGroup" style="margin-top:10px;display:none">';
+    $content .= '<select class="input" id="broadcastGroupSelect"></select>';
+    $content .= '</div>';
+    $content .= '<div id="broadcastAudienceTag" style="margin-top:10px;display:none">';
+    $content .= '<select class="input" id="broadcastTagSelect"></select>';
+    $content .= '</div>';
+    $content .= '<div id="broadcastAudiencePaste" style="margin-top:10px;display:none">';
+    $content .= '<textarea class="input" id="broadcastPasteNumbers" placeholder="One phone number per line (+1...)" rows="4" style="resize:none"></textarea>';
+    $content .= '</div>';
+    $content .= '<div class="small" style="margin-top:10px">Preview will exclude opted-out recipients if STOP/START automation is enabled.</div>';
+    $content .= '</div>';
+
+    $content .= '<div class="card" style="margin-top:12px">';
+    $content .= '<div class="small" style="margin-bottom:10px">Message</div>';
+    $content .= '<div class="row" style="align-items:flex-end;flex-wrap:wrap">';
+    $content .= '<div style="min-width:260px;flex:1">';
+    $content .= '<div class="small" style="margin-bottom:6px">Template</div>';
+    $content .= '<select class="input" id="broadcastTemplate"></select>';
+    $content .= '</div>';
+    $content .= '<div class="row">';
+    $content .= '<button class="btn" type="button" id="broadcastTemplateSaveBtn">Save template</button>';
+    $content .= '<button class="btn danger" type="button" id="broadcastTemplateDeleteBtn">Delete</button>';
+    $content .= '</div>';
+    $content .= '</div>';
+    $content .= '<div style="height:10px"></div>';
+    $content .= '<select class="input" id="broadcastMergeField"></select>';
+    $content .= '<div class="small" style="margin-top:6px">Click a field to insert into the message.</div>';
+    $content .= '<div style="height:10px"></div>';
+    $content .= '<select class="input" id="broadcastFromNumber"></select>';
+    $content .= '<div style="height:10px"></div>';
+    $content .= '<textarea class="input" id="broadcastBody" placeholder="Write your message" rows="4" style="resize:none"></textarea>';
+    $content .= '<div class="small" id="broadcastSmsCounter" style="margin-top:6px"></div>';
+    $content .= '<div style="height:10px"></div>';
+    $content .= '<div class="row">';
+    $content .= '<button class="btn" type="button" id="broadcastPreviewBtn">Preview</button>';
+    $content .= '<button class="btn danger" type="button" id="broadcastSendBtn">Send</button>';
+    $content .= '</div>';
+    $content .= '<div class="small" style="margin-top:10px">Merge tags supported: {first_name} {last_name} {name} {email} {phone_number} and custom fields {field_key}.</div>';
+    $content .= '</div>';
+
+    $content .= '<div class="card" style="margin-top:12px">';
+    $content .= '<div class="small">Preview</div>';
+    $content .= '<div id="broadcastPreview" style="margin-top:10px"></div>';
+    $content .= '</div>';
+
+    $content .= '</div>';
+
+    $content .= '<div id="broadcastSectionTemplates" class="broadcastSection" data-btab="templates" style="display:none">';
+    $content .= '<div class="card" style="margin-top:12px">';
+    $content .= '<div class="row" style="align-items:center;justify-content:space-between">';
+    $content .= '<div class="small">Templates</div>';
+    $content .= '<div class="row">';
+    $content .= '<button class="btn" type="button" id="broadcastTemplatesRefresh">Refresh</button>';
+    $content .= '<button class="btn primary" type="button" id="broadcastTemplatesNew">New</button>';
+    $content .= '</div>';
+    $content .= '</div>';
+    $content .= '<div style="height:12px"></div>';
+    $content .= '<select class="input" id="broadcastTemplatesSelect"></select>';
+    $content .= '<div style="height:12px"></div>';
+    $content .= '<div class="small">Name</div>';
+    $content .= '<input class="input" id="broadcastTemplateName" placeholder="Template name">';
+    $content .= '<div style="height:10px"></div>';
+    $content .= '<select class="input" id="broadcastTemplateMergeField"></select>';
+    $content .= '<div class="small" style="margin-top:6px">Click a field to insert into the template.</div>';
+    $content .= '<div style="height:10px"></div>';
+    $content .= '<div class="small">Body</div>';
+    $content .= '<textarea class="input" id="broadcastTemplateBody" placeholder="Template message" rows="6" style="resize:vertical"></textarea>';
+    $content .= '<div class="small" id="broadcastTemplateSmsCounter" style="margin-top:6px"></div>';
+    $content .= '<div style="height:12px"></div>';
+    $content .= '<div class="row">';
+    $content .= '<button class="btn primary" type="button" id="broadcastTemplatesSave">Save</button>';
+    $content .= '<button class="btn danger" type="button" id="broadcastTemplatesDelete">Delete</button>';
+    $content .= '</div>';
+    $content .= '</div>';
+    $content .= '</div>';
+
     $content .= '</section>';
 
     $content .= '<section class="view" id="viewNumbers" style="display:none">';
@@ -2024,7 +2694,33 @@ if ($uri === '/app' && $method === 'GET') {
     $content .= '</div>';
     $content .= '<div class="card">';
     $content .= '<div class="small" style="margin-bottom:10px">Users</div>';
+    $content .= '<div class="small" style="margin-bottom:10px">RBAC role assignments (in addition to legacy user.role)</div>';
     $content .= '<div class="list" id="usersList"></div>';
+    $content .= '</div>';
+    $content .= '</div>';
+    $content .= '</section>';
+
+    $content .= '<section class="view" id="viewRoles" style="display:none">';
+    $content .= '<div class="pageHeader"><div class="pageTitle">Roles</div><div class="small">Admin: manage roles & permissions</div></div>';
+    $content .= '<div class="pageGrid">';
+    $content .= '<div class="card">';
+    $content .= '<div class="row" style="align-items:center;justify-content:space-between">';
+    $content .= '<div class="small">Roles & permissions</div>';
+    $content .= '<button class="btn" type="button" id="refreshRbac">Refresh</button>';
+    $content .= '</div>';
+    $content .= '<div style="height:12px"></div>';
+    $content .= '<div class="row" style="align-items:center;gap:10px">';
+    $content .= '<select class="input" id="rbacRoleSelect" style="flex:1"></select>';
+    $content .= '<button class="btn" type="button" id="rbacNewRole">New role</button>';
+    $content .= '<button class="btn danger" type="button" id="rbacDeleteRole">Delete</button>';
+    $content .= '</div>';
+    $content .= '<div style="height:10px"></div>';
+    $content .= '<input class="input" id="rbacRoleName" placeholder="Role name">';
+    $content .= '<div style="height:12px"></div>';
+    $content .= '<div class="small" style="margin-bottom:10px">Permissions</div>';
+    $content .= '<div class="list" id="rbacPermissionsList"></div>';
+    $content .= '<div style="height:12px"></div>';
+    $content .= '<button class="btn primary" type="button" id="rbacSaveRolePerms">Save permissions</button>';
     $content .= '</div>';
     $content .= '</div>';
     $content .= '</section>';
@@ -2035,6 +2731,12 @@ if ($uri === '/app' && $method === 'GET') {
     $content .= '<div>';
     $content .= '<div class="callTitle" id="callBarStatus">Call</div>';
     $content .= '<div class="small">Duration: <span id="callBarTimer">00:00</span></div>';
+    $content .= '<div class="small">DTMF: <span id="callDtmfLog"></span></div>';
+    $content .= '</div>';
+    $content .= '<div id="callDtmfPad" style="display:none;gap:6px;flex-wrap:wrap;max-width:220px">';
+    foreach (['1','2','3','4','5','6','7','8','9','*','0','#'] as $k) {
+        $content .= '<button class="btn" type="button" data-dtmf="' . h($k) . '" style="width:64px">' . h($k) . '</button>';
+    }
     $content .= '</div>';
     $content .= '<div class="row" style="justify-content:flex-end">';
     $content .= '<button class="btn" type="button" id="recordBtn">Record</button>';
@@ -2054,6 +2756,24 @@ if ($uri === '/app' && $method === 'GET') {
     $content .= '</div>';
     $content .= '</div>';
 
+    $content .= '<div class="incomingModal" id="rbacNewRoleModal" style="display:none">';
+    $content .= '<div class="incomingCard" style="width:min(560px,calc(100vw - 28px))">';
+    $content .= '<div class="row" style="align-items:center;justify-content:space-between">';
+    $content .= '<div class="incomingTitle">Create role</div>';
+    $content .= '<button class="btn" type="button" id="rbacNewRoleClose">Close</button>';
+    $content .= '</div>';
+    $content .= '<div class="card" style="margin-top:12px">';
+    $content .= '<div class="small">Role name</div>';
+    $content .= '<input class="input" id="rbacNewRoleName" placeholder="e.g. Manager">';
+    $content .= '<div style="height:12px"></div>';
+    $content .= '<div class="row" style="justify-content:flex-end">';
+    $content .= '<button class="btn" type="button" id="rbacNewRoleCancel">Cancel</button>';
+    $content .= '<button class="btn primary" type="button" id="rbacNewRoleCreate">Create</button>';
+    $content .= '</div>';
+    $content .= '</div>';
+    $content .= '</div>';
+    $content .= '</div>';
+
     $content .= '<script src="/app.js"></script>';
 
     render('Dashboard', $content);
@@ -2069,7 +2789,34 @@ if ($uri === '/migrate' && $method === 'GET') {
         render('Migrate', '<div class="topbar"><div class="brand">Migration</div></div><div class="error">' . h($e->getMessage()) . '</div>');
         exit;
     }
-    render('Migrate', '<div class="topbar"><div class="brand">Migration</div></div><div class="ok">Migration complete.</div>');
+
+    $rows = [];
+    try {
+        $stmt = $pdo->query('SELECT migration_key, description, applied_at FROM schema_migrations ORDER BY applied_at DESC, id DESC LIMIT 50');
+        $rows = $stmt ? $stmt->fetchAll() : [];
+    } catch (\Throwable $e) {
+        $rows = [];
+    }
+
+    $html = '<div class="topbar"><div class="brand">Migration</div></div>';
+    $html .= '<div class="ok">Migration complete.</div>';
+    $html .= '<div class="card" style="margin-top:12px">';
+    $html .= '<div class="small" style="margin-bottom:10px">Recent changes</div>';
+    if (!$rows) {
+        $html .= '<div class="small">No migration history yet.</div>';
+    } else {
+        $html .= '<div class="list">';
+        foreach ($rows as $r) {
+            $k = h((string)($r['migration_key'] ?? ''));
+            $d = h((string)($r['description'] ?? ''));
+            $t = h((string)($r['applied_at'] ?? ''));
+            $html .= '<div class="item"><div><strong>' . $d . '</strong></div><div class="small" style="margin-top:6px">' . $k . ' • ' . $t . '</div></div>';
+        }
+        $html .= '</div>';
+    }
+    $html .= '</div>';
+
+    render('Migrate', $html);
     exit;
 }
 
@@ -2108,897 +2855,5 @@ if ($uri === '/api/voice/token' && $method === 'GET') {
     json(['token' => $token->toJWT(), 'identity' => $identity]);
 }
 
-if ($uri === '/api/calls' && $method === 'GET') {
-    Auth::requireLogin();
-    $pdo = getPdo($rootDir);
-
-    $limit = (int) ($_GET['limit'] ?? 50);
-    if ($limit < 1) {
-        $limit = 50;
-    }
-    if ($limit > 200) {
-        $limit = 200;
-    }
-
-    $stmt = $pdo->prepare('SELECT c.*, u.email AS user_email
-        FROM calls c
-        LEFT JOIN users u ON u.id = c.user_id
-        ORDER BY c.created_at DESC
-        LIMIT ' . $limit);
-    $stmt->execute();
-    $rows = $stmt->fetchAll();
-    json(['calls' => $rows]);
-}
-
-if ($uri === '/api/admin/numbers' && $method === 'GET') {
-    Auth::requireLogin();
-    $pdo = getPdo($rootDir);
-    requireAdmin($pdo);
-
-    $stmt = $pdo->query('SELECT n.id, n.phone_number, n.friendly_name, n.twilio_account_id, n.voice_forward_number, n.voice_ring_timeout
-        FROM numbers n
-        ORDER BY n.phone_number ASC');
-    $numbers = $stmt->fetchAll();
-
-    $mapStmt = $pdo->query('SELECT un.user_id, un.number_id, un.is_default, u.email
-        FROM user_numbers un
-        INNER JOIN users u ON u.id = un.user_id
-        ORDER BY u.email ASC');
-    $mappings = $mapStmt->fetchAll();
-
-    json(['numbers' => $numbers, 'mappings' => $mappings]);
-}
-
-if ($uri === '/api/admin/numbers/add' && $method === 'POST') {
-    Auth::requireLogin();
-    $pdo = getPdo($rootDir);
-    requireAdmin($pdo);
-
-    $payload = json_decode((string) file_get_contents('php://input'), true);
-    $pn = trim((string) ($payload['phone_number'] ?? ''));
-    $name = trim((string) ($payload['friendly_name'] ?? ''));
-    if ($pn === '') {
-        json(['error' => 'phone_number is required'], 422);
-    }
-
-    $pdo->prepare('INSERT IGNORE INTO numbers (phone_number, friendly_name) VALUES (:pn, :fn)')
-        ->execute([':pn' => $pn, ':fn' => ($name !== '' ? $name : null)]);
-    json(['ok' => true]);
-}
-
-if ($uri === '/api/admin/numbers/update' && $method === 'POST') {
-    Auth::requireLogin();
-    $pdo = getPdo($rootDir);
-    requireAdmin($pdo);
-
-    $payload = json_decode((string) file_get_contents('php://input'), true);
-    if (!is_array($payload)) {
-        json(['error' => 'Invalid JSON'], 400);
-    }
-    $id = (int) ($payload['id'] ?? 0);
-    if ($id <= 0) {
-        json(['error' => 'id is required'], 422);
-    }
-
-    $updates = [];
-    $params = [':id' => $id];
-
-    if (array_key_exists('friendly_name', $payload)) {
-        $name = trim((string) ($payload['friendly_name'] ?? ''));
-        $updates[] = 'friendly_name = :fn';
-        $params[':fn'] = ($name !== '' ? $name : null);
-    }
-
-    $twilioAccountId = null;
-    if (array_key_exists('twilio_account_id', $payload)) {
-        $twilioAccountId = (int) ($payload['twilio_account_id'] ?? 0);
-        if ($twilioAccountId <= 0) {
-            $twilioAccountId = null;
-        }
-    }
-
-    $voiceForward = null;
-    if (array_key_exists('voice_forward_number', $payload)) {
-        $vf = trim((string) ($payload['voice_forward_number'] ?? ''));
-        $voiceForward = ($vf !== '' ? $vf : null);
-    }
-    $voiceRingTimeout = null;
-    if (array_key_exists('voice_ring_timeout', $payload)) {
-        $vrt = (int) ($payload['voice_ring_timeout'] ?? 0);
-        if ($vrt <= 0) {
-            $voiceRingTimeout = null;
-        } else {
-            if ($vrt < 5) {
-                $vrt = 5;
-            }
-            if ($vrt > 60) {
-                $vrt = 60;
-            }
-            $voiceRingTimeout = $vrt;
-        }
-    }
-
-    if (array_key_exists('twilio_account_id', $payload)) {
-        $updates[] = 'twilio_account_id = :tid';
-        $params[':tid'] = $twilioAccountId;
-    }
-    if (count($updates) === 0) {
-        json(['ok' => true]);
-    }
-    $sql = 'UPDATE numbers SET ' . implode(', ', $updates) . ' WHERE id = :id';
-    $pdo->prepare($sql)->execute($params);
-    json(['ok' => true]);
-}
-
-if ($uri === '/api/admin/numbers/save' && $method === 'POST') {
-    Auth::requireLogin();
-    $pdo = getPdo($rootDir);
-    requireAdmin($pdo);
-
-    $payload = json_decode((string) file_get_contents('php://input'), true);
-    if (!is_array($payload)) {
-        json(['error' => 'Invalid JSON'], 400);
-    }
-
-    $id = (int) ($payload['id'] ?? 0);
-    if ($id <= 0) {
-        json(['error' => 'id is required'], 422);
-    }
-
-    $friendly = null;
-    if (array_key_exists('friendly_name', $payload)) {
-        $name = trim((string) ($payload['friendly_name'] ?? ''));
-        $friendly = ($name !== '' ? $name : null);
-    }
-
-    $twilioAccountId = null;
-    if (array_key_exists('twilio_account_id', $payload)) {
-        $twilioAccountId = (int) ($payload['twilio_account_id'] ?? 0);
-        if ($twilioAccountId <= 0) {
-            $twilioAccountId = null;
-        }
-    }
-
-    $userIds = $payload['user_ids'] ?? [];
-    if (!is_array($userIds)) {
-        $userIds = [];
-    }
-    $cleanUserIds = [];
-    foreach ($userIds as $uid) {
-        $u = (int) $uid;
-        if ($u > 0) {
-            $cleanUserIds[] = $u;
-        }
-    }
-    $cleanUserIds = array_values(array_unique($cleanUserIds));
-
-    $defaultUserId = (int) ($payload['default_user_id'] ?? 0);
-    if ($defaultUserId > 0 && !in_array($defaultUserId, $cleanUserIds, true)) {
-        $defaultUserId = 0;
-    }
-
-    try {
-        $pdo->beginTransaction();
-
-        $updates = [];
-        $params = [':id' => $id];
-        if (array_key_exists('friendly_name', $payload)) {
-            $updates[] = 'friendly_name = :fn';
-            $params[':fn'] = $friendly;
-        }
-        if (array_key_exists('twilio_account_id', $payload)) {
-            $updates[] = 'twilio_account_id = :tid';
-            $params[':tid'] = $twilioAccountId;
-        }
-        if (array_key_exists('voice_forward_number', $payload)) {
-            $updates[] = 'voice_forward_number = :vfn';
-            $params[':vfn'] = $voiceForward;
-        }
-        if (array_key_exists('voice_ring_timeout', $payload)) {
-            $updates[] = 'voice_ring_timeout = :vrt';
-            $params[':vrt'] = $voiceRingTimeout;
-        }
-        if (count($updates) > 0) {
-            $pdo->prepare('UPDATE numbers SET ' . implode(', ', $updates) . ' WHERE id = :id')->execute($params);
-        }
-
-        if (array_key_exists('user_ids', $payload)) {
-            $pdo->prepare('DELETE FROM user_numbers WHERE number_id = :nid')->execute([':nid' => $id]);
-            if (count($cleanUserIds) > 0) {
-                $ins = $pdo->prepare('INSERT INTO user_numbers (user_id, number_id, is_default) VALUES (:uid, :nid, :def)');
-                foreach ($cleanUserIds as $uid) {
-                    $ins->execute([
-                        ':uid' => $uid,
-                        ':nid' => $id,
-                        ':def' => ($defaultUserId > 0 && $uid === $defaultUserId) ? 1 : 0,
-                    ]);
-                }
-            }
-        }
-
-        $pdo->commit();
-    } catch (\Throwable $e) {
-        try { $pdo->rollBack(); } catch (\Throwable $e2) {}
-        json(['error' => 'Save failed'], 500);
-    }
-
-    json(['ok' => true]);
-}
-
-if ($uri === '/api/admin/twilio-accounts' && $method === 'GET') {
-    Auth::requireLogin();
-    $pdo = getPdo($rootDir);
-    requireAdmin($pdo);
-
-    $stmt = $pdo->query('SELECT id, name, account_sid, twiml_app_sid, default_from_number, created_at
-        FROM twilio_accounts
-        ORDER BY name ASC');
-    json(['accounts' => $stmt->fetchAll()]);
-}
-
-if ($uri === '/api/admin/settings/default-twilio' && $method === 'GET') {
-    Auth::requireLogin();
-    $pdo = getPdo($rootDir);
-    requireAdmin($pdo);
-
-    json([
-        'default_twilio_account_id' => (int) appSettingGet($pdo, 'default_twilio_account_id', '0'),
-    ]);
-}
-
-if ($uri === '/api/admin/settings/default-twilio' && $method === 'POST') {
-    Auth::requireLogin();
-    $pdo = getPdo($rootDir);
-    requireAdmin($pdo);
-
-    $payload = json_decode((string) file_get_contents('php://input'), true);
-    if (!is_array($payload)) {
-        json(['error' => 'Invalid JSON'], 400);
-    }
-
-    $id = (int) ($payload['default_twilio_account_id'] ?? 0);
-    if ($id < 0) {
-        $id = 0;
-    }
-    if ($id > 0) {
-        $stmt = $pdo->prepare('SELECT id FROM twilio_accounts WHERE id = :id LIMIT 1');
-        $stmt->execute([':id' => $id]);
-        if (!$stmt->fetch()) {
-            json(['error' => 'Unknown twilio account id'], 422);
-        }
-    }
-
-    appSettingSet($pdo, 'default_twilio_account_id', (string) $id);
-    json(['ok' => true]);
-}
-
-if ($uri === '/api/admin/twilio-accounts/add' && $method === 'POST') {
-    Auth::requireLogin();
-    $pdo = getPdo($rootDir);
-    requireAdmin($pdo);
-
-    $payload = json_decode((string) file_get_contents('php://input'), true);
-    $name = trim((string) ($payload['name'] ?? ''));
-    $sid = trim((string) ($payload['account_sid'] ?? ''));
-    $token = trim((string) ($payload['auth_token'] ?? ''));
-    $apiKey = trim((string) ($payload['api_key'] ?? ''));
-    $apiSecret = trim((string) ($payload['api_secret'] ?? ''));
-    $appSid = trim((string) ($payload['twiml_app_sid'] ?? ''));
-    $from = trim((string) ($payload['default_from_number'] ?? ''));
-
-    if ($name === '' || $sid === '' || $token === '') {
-        json(['error' => 'name, account_sid, auth_token are required'], 422);
-    }
-
-    $pdo->prepare('INSERT INTO twilio_accounts (name, account_sid, auth_token, api_key, api_secret, twiml_app_sid, default_from_number)
-        VALUES (:n, :sid, :tok, :k, :s, :app, :from)
-        ON DUPLICATE KEY UPDATE account_sid = VALUES(account_sid), auth_token = VALUES(auth_token), api_key = VALUES(api_key), api_secret = VALUES(api_secret), twiml_app_sid = VALUES(twiml_app_sid), default_from_number = VALUES(default_from_number)')
-        ->execute([
-            ':n' => $name,
-            ':sid' => $sid,
-            ':tok' => $token,
-            ':k' => ($apiKey !== '' ? $apiKey : null),
-            ':s' => ($apiSecret !== '' ? $apiSecret : null),
-            ':app' => ($appSid !== '' ? $appSid : null),
-            ':from' => ($from !== '' ? $from : null),
-        ]);
-
-    json(['ok' => true]);
-}
-
-if ($uri === '/api/admin/twilio-accounts/delete' && $method === 'POST') {
-    Auth::requireLogin();
-    $pdo = getPdo($rootDir);
-    requireAdmin($pdo);
-
-    $payload = json_decode((string) file_get_contents('php://input'), true);
-    $id = (int) ($payload['id'] ?? 0);
-    if ($id <= 0) {
-        json(['error' => 'id is required'], 422);
-    }
-
-    $pdo->prepare('DELETE FROM twilio_accounts WHERE id = :id')->execute([':id' => $id]);
-    json(['ok' => true]);
-}
-
-if ($uri === '/api/admin/settings/voice-routing' && $method === 'GET') {
-    Auth::requireLogin();
-    $pdo = getPdo($rootDir);
-    requireAdmin($pdo);
-
-    json([
-        'voice_ring_timeout' => (int) appSettingGet($pdo, 'voice_ring_timeout', '20'),
-        'voice_forward_number' => appSettingGet($pdo, 'voice_forward_number', ''),
-        'voice_voicemail_enabled' => appSettingGet($pdo, 'voice_voicemail_enabled', '0') === '1',
-        'voice_voicemail_greeting' => appSettingGet($pdo, 'voice_voicemail_greeting', 'Please leave a message after the tone.'),
-        'voice_voicemail_max_length' => (int) appSettingGet($pdo, 'voice_voicemail_max_length', '60'),
-        'voice_record_calls' => appSettingGet($pdo, 'voice_record_calls', '0') === '1',
-    ]);
-}
-
-if ($uri === '/api/admin/settings/voice-routing' && $method === 'POST') {
-    Auth::requireLogin();
-    $pdo = getPdo($rootDir);
-    requireAdmin($pdo);
-
-    $payload = json_decode((string) file_get_contents('php://input'), true);
-    if (!is_array($payload)) {
-        json(['error' => 'Invalid JSON'], 400);
-    }
-
-    $timeout = (int) ($payload['voice_ring_timeout'] ?? 20);
-    if ($timeout < 5) {
-        $timeout = 5;
-    }
-    if ($timeout > 60) {
-        $timeout = 60;
-    }
-
-    $forward = trim((string) ($payload['voice_forward_number'] ?? ''));
-    $vmEnabled = !empty($payload['voice_voicemail_enabled']) ? '1' : '0';
-    $greeting = trim((string) ($payload['voice_voicemail_greeting'] ?? ''));
-    if ($greeting === '') {
-        $greeting = 'Please leave a message after the tone.';
-    }
-    $vmMax = (int) ($payload['voice_voicemail_max_length'] ?? 60);
-    if ($vmMax < 10) {
-        $vmMax = 10;
-    }
-    if ($vmMax > 300) {
-        $vmMax = 300;
-    }
-
-    $recordCalls = !empty($payload['voice_record_calls']) ? '1' : '0';
-
-    appSettingSet($pdo, 'voice_ring_timeout', (string) $timeout);
-    appSettingSet($pdo, 'voice_forward_number', $forward);
-    appSettingSet($pdo, 'voice_voicemail_enabled', $vmEnabled);
-    appSettingSet($pdo, 'voice_voicemail_greeting', $greeting);
-    appSettingSet($pdo, 'voice_voicemail_max_length', (string) $vmMax);
-    appSettingSet($pdo, 'voice_record_calls', $recordCalls);
-
-    json(['ok' => true]);
-}
-
-if ($uri === '/api/admin/voicemails' && $method === 'GET') {
-    Auth::requireLogin();
-    $pdo = getPdo($rootDir);
-    requireAdmin($pdo);
-
-    $limit = (int) ($_GET['limit'] ?? 50);
-    if ($limit < 1) {
-        $limit = 50;
-    }
-    if ($limit > 200) {
-        $limit = 200;
-    }
-
-    $stmt = $pdo->prepare('SELECT id, call_sid, from_number, to_number, recording_url, recording_duration, created_at
-        FROM voicemails
-        ORDER BY created_at DESC
-        LIMIT ' . $limit);
-    $stmt->execute();
-    $rows = $stmt->fetchAll();
-    $out = [];
-    if (is_array($rows)) {
-        foreach ($rows as $r) {
-            $row = is_array($r) ? $r : [];
-            $url = trim((string) (($row['recording_url'] ?? '') ?: ''));
-            $sid = '';
-            if ($url !== '' && preg_match('/\/Recordings\/(RE[a-zA-Z0-9]+)/', $url, $m)) {
-                $sid = (string) ($m[1] ?? '');
-            }
-            $row['recording_sid'] = $sid !== '' ? $sid : null;
-            $row['recording_proxy_url'] = $sid !== '' ? ('/api/voice/recording?sid=' . rawurlencode($sid)) : null;
-            $out[] = $row;
-        }
-    }
-    json(['voicemails' => $out]);
-}
-
-if ($uri === '/api/admin/numbers/assign' && $method === 'POST') {
-    Auth::requireLogin();
-    $pdo = getPdo($rootDir);
-    requireAdmin($pdo);
-
-    $payload = json_decode((string) file_get_contents('php://input'), true);
-    $userId = (int) ($payload['user_id'] ?? 0);
-    $numberId = (int) ($payload['number_id'] ?? 0);
-    if ($userId <= 0 || $numberId <= 0) {
-        json(['error' => 'user_id and number_id required'], 422);
-    }
-
-    $pdo->prepare('INSERT IGNORE INTO user_numbers (user_id, number_id, is_default) VALUES (:uid, :nid, 0)')
-        ->execute([':uid' => $userId, ':nid' => $numberId]);
-    json(['ok' => true]);
-}
-
-if ($uri === '/api/admin/numbers/unassign' && $method === 'POST') {
-    Auth::requireLogin();
-    $pdo = getPdo($rootDir);
-    requireAdmin($pdo);
-
-    $payload = json_decode((string) file_get_contents('php://input'), true);
-    $userId = (int) ($payload['user_id'] ?? 0);
-    $numberId = (int) ($payload['number_id'] ?? 0);
-    if ($userId <= 0 || $numberId <= 0) {
-        json(['error' => 'user_id and number_id required'], 422);
-    }
-
-    $pdo->prepare('DELETE FROM user_numbers WHERE user_id = :uid AND number_id = :nid')
-        ->execute([':uid' => $userId, ':nid' => $numberId]);
-    json(['ok' => true]);
-}
-
-if ($uri === '/api/admin/numbers/set-default' && $method === 'POST') {
-    Auth::requireLogin();
-    $pdo = getPdo($rootDir);
-    requireAdmin($pdo);
-
-    $payload = json_decode((string) file_get_contents('php://input'), true);
-    $userId = (int) ($payload['user_id'] ?? 0);
-    $numberId = (int) ($payload['number_id'] ?? 0);
-    if ($userId <= 0 || $numberId <= 0) {
-        json(['error' => 'user_id and number_id required'], 422);
-    }
-
-    $pdo->prepare('UPDATE user_numbers SET is_default = 0 WHERE user_id = :uid')
-        ->execute([':uid' => $userId]);
-    $pdo->prepare('INSERT INTO user_numbers (user_id, number_id, is_default) VALUES (:uid, :nid, 1)
-        ON DUPLICATE KEY UPDATE is_default = 1')
-        ->execute([':uid' => $userId, ':nid' => $numberId]);
-    json(['ok' => true]);
-}
-
-if ($uri === '/api/inbox/conversations' && $method === 'GET') {
-    Auth::requireLogin();
-    $pdo = getPdo($rootDir);
-    $q = trim((string)($_GET['q'] ?? ''));
-    $assigned = trim((string)($_GET['assigned'] ?? ''));
-
-    $sql = 'SELECT c.id AS conversation_id,
-        ct.id AS contact_id,
-        ct.name AS contact_name,
-        ct.phone_number AS contact_phone,
-        c.last_message_preview,
-        c.last_message_at,
-        c.assigned_user_id,
-        u.email AS assigned_user_email,
-        c.default_number_id,
-        n.phone_number AS conversation_number
-      FROM conversations c
-      INNER JOIN contacts ct ON ct.id = c.contact_id
-      LEFT JOIN users u ON u.id = c.assigned_user_id
-      LEFT JOIN numbers n ON n.id = c.default_number_id
-      WHERE 1=1';
-
-    $params = [];
-    if ($q !== '') {
-        $sql .= ' AND (ct.phone_number LIKE :q OR ct.name LIKE :q)';
-        $params[':q'] = '%' . $q . '%';
-    }
-    if ($assigned === 'me') {
-        $sql .= ' AND c.assigned_user_id = :me';
-        $params[':me'] = Auth::userId();
-    }
-
-    $sql .= ' ORDER BY c.last_message_at DESC, c.id DESC LIMIT 100';
-
-    $stmt = $pdo->prepare($sql);
-    $stmt->execute($params);
-    json(['conversations' => $stmt->fetchAll()]);
-}
-
-if ($uri === '/api/inbox/conversations/create' && $method === 'POST') {
-    Auth::requireLogin();
-    $pdo = getPdo($rootDir);
-
-    $raw = file_get_contents('php://input');
-    $data = json_decode($raw ?: '', true);
-    if (!is_array($data)) {
-        $data = $_POST;
-    }
-
-    $phone = trim((string) ($data['phone_number'] ?? ''));
-    $defaultNumberId = (int) ($data['default_number_id'] ?? 0);
-    if ($phone === '' || $defaultNumberId <= 0) {
-        json(['error' => 'phone_number and default_number_id required'], 422);
-    }
-
-    $chk = $pdo->prepare('SELECT 1 FROM user_numbers WHERE user_id = :uid AND number_id = :nid LIMIT 1');
-    $chk->execute([':uid' => Auth::userId(), ':nid' => $defaultNumberId]);
-    if (!$chk->fetch()) {
-        json(['error' => 'You do not have access to that number'], 403);
-    }
-
-    $contactId = getOrCreateContactId($pdo, $phone);
-    $cid = getOrCreateConversationId($pdo, $contactId, $defaultNumberId);
-    json(['ok' => true, 'conversation_id' => $cid]);
-}
-
-if ($uri === '/api/inbox/messages' && $method === 'GET') {
-    Auth::requireLogin();
-    $pdo = getPdo($rootDir);
-    $conversationId = (int) ($_GET['conversation_id'] ?? 0);
-    if ($conversationId <= 0) {
-        json(['error' => 'conversation_id required'], 422);
-    }
-    $stmt = $pdo->prepare('SELECT m.id, m.direction, m.from_number, m.to_number, m.body, m.status, m.created_at,
-        m.user_id, u.email AS user_email
-      FROM messages m
-      LEFT JOIN users u ON u.id = m.user_id
-      WHERE m.conversation_id = :cid
-      ORDER BY m.id ASC
-      LIMIT 500');
-    $stmt->execute([':cid' => $conversationId]);
-    json(['messages' => $stmt->fetchAll()]);
-}
-
-if ($uri === '/api/inbox/send' && $method === 'POST') {
-    Auth::requireLogin();
-    $pdo = getPdo($rootDir);
-
-    $raw = file_get_contents('php://input');
-    $data = json_decode($raw ?: '', true);
-    if (!is_array($data)) {
-        $data = $_POST;
-    }
-
-    $conversationId = (int) ($data['conversation_id'] ?? 0);
-    $body = trim((string) ($data['body'] ?? ''));
-    $fromNumberId = (int) ($data['from_number_id'] ?? 0);
-
-    if ($conversationId <= 0 || $body === '') {
-        json(['error' => 'conversation_id and body required'], 422);
-    }
-
-    $convStmt = $pdo->prepare('SELECT c.id, c.contact_id, ct.phone_number AS to_number, c.default_number_id, n.phone_number AS default_from
-        FROM conversations c
-        INNER JOIN contacts ct ON ct.id = c.contact_id
-        LEFT JOIN numbers n ON n.id = c.default_number_id
-        WHERE c.id = :id LIMIT 1');
-    $convStmt->execute([':id' => $conversationId]);
-    $conv = $convStmt->fetch();
-    if (!$conv) {
-        json(['error' => 'Conversation not found'], 404);
-    }
-
-    $to = (string) ($conv['to_number'] ?? '');
-    $from = '';
-    $fromTwilioAccountId = null;
-
-    $sendConversationId = $conversationId;
-    $convDefaultNumberId = (int) (($conv['default_number_id'] ?? 0) ?: 0);
-    if ($fromNumberId > 0 && $convDefaultNumberId > 0 && $fromNumberId !== $convDefaultNumberId) {
-        $sendConversationId = getOrCreateConversationId($pdo, (int) ($conv['contact_id'] ?? 0), $fromNumberId);
-    }
-
-    if ($fromNumberId > 0) {
-        $fromStmt = $pdo->prepare('SELECT n.phone_number, n.twilio_account_id FROM numbers n
-            INNER JOIN user_numbers un ON un.number_id = n.id
-            WHERE un.user_id = :uid AND n.id = :nid LIMIT 1');
-        $fromStmt->execute([':uid' => Auth::userId(), ':nid' => $fromNumberId]);
-        $row = $fromStmt->fetch();
-        $from = (string) (($row['phone_number'] ?? '') ?: '');
-        $tid = (int) (($row['twilio_account_id'] ?? 0) ?: 0);
-        if ($tid > 0) {
-            $fromTwilioAccountId = $tid;
-        }
-    }
-
-    if ($from === '') {
-        $from = (string) (($conv['default_from'] ?? '') ?: '');
-    }
-
-    if ($from === '') {
-        $fallback = $pdo->prepare('SELECT n.phone_number FROM numbers n
-            INNER JOIN user_numbers un ON un.number_id = n.id
-            WHERE un.user_id = :uid
-            ORDER BY un.is_default DESC, n.id ASC
-            LIMIT 1');
-        $fallback->execute([':uid' => Auth::userId()]);
-        $from = (string) (($fallback->fetch()['phone_number'] ?? '') ?: '');
-    }
-
-    if ($from === '') {
-        $cfg = twilioConfig($pdo, Auth::userId());
-        $from = (string) (($cfg['default_from_number'] ?? '') ?: '');
-    }
-
-    if ($from === '' || $to === '') {
-        json(['error' => 'Missing from/to numbers'], 500);
-    }
-
-    if ($fromTwilioAccountId === null) {
-        $stmtTid = $pdo->prepare('SELECT twilio_account_id FROM numbers WHERE phone_number = :pn LIMIT 1');
-        $stmtTid->execute([':pn' => $from]);
-        $tid = (int) (($stmtTid->fetch()['twilio_account_id'] ?? 0) ?: 0);
-        if ($tid > 0) {
-            $fromTwilioAccountId = $tid;
-        }
-    }
-
-    $sid = '';
-    $token = '';
-    if ($fromTwilioAccountId !== null) {
-        $accStmt = $pdo->prepare('SELECT account_sid, auth_token FROM twilio_accounts WHERE id = :id LIMIT 1');
-        $accStmt->execute([':id' => $fromTwilioAccountId]);
-        $acc = $accStmt->fetch();
-        $sid = (string) (($acc['account_sid'] ?? '') ?: '');
-        $token = (string) (($acc['auth_token'] ?? '') ?: '');
-    }
-
-    if ($sid === '' || $token === '') {
-        $cfg = twilioConfig($pdo, Auth::userId());
-        $sid = (string) ($cfg['account_sid'] ?? '');
-        $token = (string) ($cfg['auth_token'] ?? '');
-    }
-    if ($sid === '' || $token === '') {
-        json(['error' => 'Missing Twilio Messaging credentials. Configure a Twilio profile in Settings and set a default profile.'], 500);
-    }
-
-    $client = new Client($sid, $token);
-    $statusCallback = baseUrl() . '/webhooks/twilio/sms/status';
-
-    try {
-        $msg = $client->messages->create($to, [
-            'from' => $from,
-            'body' => $body,
-            'statusCallback' => $statusCallback,
-        ]);
-    } catch (\Throwable $e) {
-        json(['error' => 'Twilio send failed', 'detail' => $e->getMessage()], 502);
-    }
-
-    $pdo->prepare('INSERT INTO messages (conversation_id, user_id, direction, from_number, to_number, body, twilio_sid, status)
-        VALUES (:cid, :uid, :dir, :from, :to, :body, :sid, :st)')
-        ->execute([
-            ':cid' => $sendConversationId,
-            ':uid' => Auth::userId(),
-            ':dir' => 'outbound',
-            ':from' => $from,
-            ':to' => $to,
-            ':body' => $body,
-            ':sid' => (string) ($msg->sid ?? ''),
-            ':st' => (string) ($msg->status ?? 'queued'),
-        ]);
-    updateConversationPreview($pdo, $sendConversationId, $body);
-
-    json(['ok' => true, 'sid' => (string) ($msg->sid ?? ''), 'status' => (string) ($msg->status ?? 'queued'), 'conversation_id' => $sendConversationId]);
-}
-
-if ($uri === '/api/inbox/notes' && $method === 'GET') {
-    Auth::requireLogin();
-    $pdo = getPdo($rootDir);
-    $conversationId = (int) ($_GET['conversation_id'] ?? 0);
-    if ($conversationId <= 0) {
-        json(['error' => 'conversation_id required'], 422);
-    }
-    $stmt = $pdo->prepare('SELECT n.id, n.note, n.created_at, n.user_id, u.email AS user_email
-        FROM conversation_notes n
-        INNER JOIN users u ON u.id = n.user_id
-        WHERE n.conversation_id = :cid
-        ORDER BY n.id DESC
-        LIMIT 200');
-    $stmt->execute([':cid' => $conversationId]);
-    json(['notes' => $stmt->fetchAll()]);
-}
-
-if ($uri === '/api/inbox/notes' && $method === 'POST') {
-    Auth::requireLogin();
-    $pdo = getPdo($rootDir);
-    $raw = file_get_contents('php://input');
-    $data = json_decode($raw ?: '', true);
-    if (!is_array($data)) {
-        $data = $_POST;
-    }
-    $conversationId = (int) ($data['conversation_id'] ?? 0);
-    $note = trim((string) ($data['note'] ?? ''));
-    if ($conversationId <= 0 || $note === '') {
-        json(['error' => 'conversation_id and note required'], 422);
-    }
-    $pdo->prepare('INSERT INTO conversation_notes (conversation_id, user_id, note) VALUES (:cid, :uid, :note)')
-        ->execute([':cid' => $conversationId, ':uid' => Auth::userId(), ':note' => $note]);
-    json(['ok' => true]);
-}
-
-if ($uri === '/api/inbox/assign' && $method === 'POST') {
-    Auth::requireLogin();
-    $pdo = getPdo($rootDir);
-    $raw = file_get_contents('php://input');
-    $data = json_decode($raw ?: '', true);
-    if (!is_array($data)) {
-        $data = $_POST;
-    }
-    $conversationId = (int) ($data['conversation_id'] ?? 0);
-    $assignedUserId = $data['assigned_user_id'] ?? null;
-    if ($conversationId <= 0) {
-        json(['error' => 'conversation_id required'], 422);
-    }
-    if ($assignedUserId === 'me') {
-        $assignedUserId = Auth::userId();
-    }
-    if ($assignedUserId === '' || $assignedUserId === null) {
-        $assignedUserId = null;
-    } else {
-        $assignedUserId = (int) $assignedUserId;
-    }
-    $pdo->prepare('UPDATE conversations SET assigned_user_id = :uid WHERE id = :id')
-        ->execute([':uid' => $assignedUserId, ':id' => $conversationId]);
-    json(['ok' => true]);
-}
-
-if ($uri === '/api/inbox/my-numbers' && $method === 'GET') {
-    Auth::requireLogin();
-    $pdo = getPdo($rootDir);
-
-    $stmt = $pdo->prepare('SELECT n.id, n.phone_number, un.is_default
-        FROM numbers n
-        INNER JOIN user_numbers un ON un.number_id = n.id
-        WHERE un.user_id = :uid
-        ORDER BY un.is_default DESC, n.id ASC');
-    $stmt->execute([':uid' => Auth::userId()]);
-    json(['numbers' => $stmt->fetchAll()]);
-}
-
-if ($uri === '/api/inbox/users' && $method === 'GET') {
-    Auth::requireLogin();
-    $pdo = getPdo($rootDir);
-    $stmt = $pdo->query('SELECT id, email, role FROM users ORDER BY id ASC');
-    json(['users' => $stmt->fetchAll()]);
-}
-
-if ($uri === '/api/inbox/contact' && $method === 'POST') {
-    Auth::requireLogin();
-    $pdo = getPdo($rootDir);
-    $raw = file_get_contents('php://input');
-    $data = json_decode($raw ?: '', true);
-    if (!is_array($data)) {
-        $data = $_POST;
-    }
-    $conversationId = (int) ($data['conversation_id'] ?? 0);
-    $name = trim((string) ($data['name'] ?? ''));
-    if ($conversationId <= 0) {
-        json(['error' => 'conversation_id required'], 422);
-    }
-    $stmt = $pdo->prepare('UPDATE contacts ct
-        INNER JOIN conversations c ON c.contact_id = ct.id
-        SET ct.name = :name
-        WHERE c.id = :cid');
-    $stmt->execute([':name' => ($name === '' ? null : $name), ':cid' => $conversationId]);
-    json(['ok' => true]);
-}
-
-if ($uri === '/api/contacts' && $method === 'GET') {
-    Auth::requireLogin();
-    $pdo = getPdo($rootDir);
-    $q = trim((string)($_GET['q'] ?? ''));
-
-    $sql = 'SELECT id, name, phone_number, created_at FROM contacts WHERE 1=1';
-    $params = [];
-    if ($q !== '') {
-        $sql .= ' AND (phone_number LIKE :q OR name LIKE :q)';
-        $params[':q'] = '%' . $q . '%';
-    }
-    $sql .= ' ORDER BY id DESC LIMIT 200';
-
-    $stmt = $pdo->prepare($sql);
-    $stmt->execute($params);
-    json(['contacts' => $stmt->fetchAll()]);
-}
-
-if ($uri === '/api/contacts/update' && $method === 'POST') {
-    Auth::requireLogin();
-    $pdo = getPdo($rootDir);
-    $raw = file_get_contents('php://input');
-    $data = json_decode($raw ?: '', true);
-    if (!is_array($data)) {
-        $data = $_POST;
-    }
-    $id = (int) ($data['id'] ?? 0);
-    $name = trim((string) ($data['name'] ?? ''));
-    if ($id <= 0) {
-        json(['error' => 'id required'], 422);
-    }
-    $stmt = $pdo->prepare('UPDATE contacts SET name = :name WHERE id = :id');
-    $stmt->execute([':name' => ($name === '' ? null : $name), ':id' => $id]);
-    json(['ok' => true]);
-}
-
-if ($uri === '/api/admin/users' && $method === 'GET') {
-    $pdo = getPdo($rootDir);
-    requireAdmin($pdo);
-    $stmt = $pdo->query('SELECT id, email, role, created_at FROM users ORDER BY id ASC');
-    json(['users' => $stmt->fetchAll()]);
-}
-
-if ($uri === '/api/admin/users/create' && $method === 'POST') {
-    $pdo = getPdo($rootDir);
-    requireAdmin($pdo);
-    $raw = file_get_contents('php://input');
-    $data = json_decode($raw ?: '', true);
-    if (!is_array($data)) {
-        $data = $_POST;
-    }
-    $email = trim((string)($data['email'] ?? ''));
-    $password = (string)($data['password'] ?? '');
-    $role = trim((string)($data['role'] ?? 'agent'));
-    if ($email === '' || strlen($password) < 8) {
-        json(['error' => 'email and password (min 8) required'], 422);
-    }
-    if ($role !== 'admin') {
-        $role = 'agent';
-    }
-    $hash = password_hash($password, PASSWORD_DEFAULT);
-    $stmt = $pdo->prepare('INSERT INTO users (email, password_hash, role) VALUES (:email, :hash, :role)');
-    try {
-        $stmt->execute([':email' => $email, ':hash' => $hash, ':role' => $role]);
-    } catch (\Throwable $e) {
-        json(['error' => 'Could not create user (email may already exist)'], 409);
-    }
-    json(['ok' => true]);
-}
-
-if ($uri === '/api/admin/users/reset-password' && $method === 'POST') {
-    $pdo = getPdo($rootDir);
-    requireAdmin($pdo);
-    $raw = file_get_contents('php://input');
-    $data = json_decode($raw ?: '', true);
-    if (!is_array($data)) {
-        $data = $_POST;
-    }
-    $id = (int)($data['id'] ?? 0);
-    $password = (string)($data['password'] ?? '');
-    if ($id <= 0 || strlen($password) < 8) {
-        json(['error' => 'id and password (min 8) required'], 422);
-    }
-    $hash = password_hash($password, PASSWORD_DEFAULT);
-    $stmt = $pdo->prepare('UPDATE users SET password_hash = :hash WHERE id = :id');
-    $stmt->execute([':hash' => $hash, ':id' => $id]);
-    json(['ok' => true]);
-}
-
-if ($uri === '/api/admin/users/set-role' && $method === 'POST') {
-    $pdo = getPdo($rootDir);
-    requireAdmin($pdo);
-    $raw = file_get_contents('php://input');
-    $data = json_decode($raw ?: '', true);
-    if (!is_array($data)) {
-        $data = $_POST;
-    }
-    $id = (int)($data['id'] ?? 0);
-    $role = trim((string)($data['role'] ?? 'agent'));
-    if ($id <= 0) {
-        json(['error' => 'id required'], 422);
-    }
-    if ($role !== 'admin') {
-        $role = 'agent';
-    }
-    $stmt = $pdo->prepare('UPDATE users SET role = :role WHERE id = :id');
-    $stmt->execute([':role' => $role, ':id' => $id]);
-    json(['ok' => true]);
-}
-
 http_response_code(404);
 render('Not Found', '<div class="topbar"><div class="brand">VOLTS CONNECT</div></div><div class="card"><h2 style="margin:0 0 8px 0">404</h2><div class="small">Page not found.</div></div>');
-

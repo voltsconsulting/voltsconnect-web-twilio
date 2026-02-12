@@ -32,10 +32,13 @@ final class Auth
 
     public static function attempt(PDO $pdo, string $email, string $password): bool
     {
-        $stmt = $pdo->prepare('SELECT id, password_hash FROM users WHERE email = :email LIMIT 1');
+        $stmt = $pdo->prepare('SELECT id, password_hash, is_active FROM users WHERE email = :email LIMIT 1');
         $stmt->execute([':email' => $email]);
         $row = $stmt->fetch();
         if (!$row) {
+            return false;
+        }
+        if (array_key_exists('is_active', (array) $row) && (int)($row['is_active'] ?? 0) !== 1) {
             return false;
         }
         if (!password_verify($password, (string) $row['password_hash'])) {
