@@ -237,3 +237,28 @@ Check:
 Your `.htaccess` rewrite is not being applied.
 
 Confirm Hostinger has Apache rewrite enabled for your hosting plan.
+
+## 12) Broadcast throttling (batch size + delay)
+
+Broadcast campaigns support optional throttling to improve reliability on shared hosting.
+
+Controls:
+
+- **Batch size**: how many recipients are processed per run.
+  - For **scheduled** campaigns, this is how many recipients are attempted per **cron tick**.
+  - For **send now**, this is how many recipients are attempted in the immediate run.
+- **Delay per message (ms)**: adds a pause after each Twilio send.
+
+Recommended starting points:
+
+- Small campaigns (<200): throttling off (default)
+- Larger campaigns (shared hosting):
+  - Batch size: `25` to `50`
+  - Delay: `100ms` to `300ms`
+
+Notes:
+
+- The app enforces bounds:
+  - batch size: 1..500
+  - delay: 0..5000ms
+- If you use a cron schedule like **every 1 minute**, a job will complete over multiple ticks until there are no pending recipients.

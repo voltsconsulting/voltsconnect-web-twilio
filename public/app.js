@@ -25,6 +25,8 @@ let state = {
   contactsFieldValues: {},
   crmTags: [],
   crmGroups: [],
+  broadcastJobs: [],
+  broadcastJobAnalytics: null,
   calls: [],
   voicemails: [],
   permissions: [],
@@ -33,6 +35,8 @@ let state = {
   rbacRoles: [],
   rbacUsers: [],
   notifRules: [],
+  addons: [],
+  addonSet: {},
   adminNumbers: [],
   adminNumberMappings: [],
   twilioAccounts: [],
@@ -44,6 +48,12 @@ let state = {
 function hasPerm(k) {
   if (!k) return true;
   if (state.permissionSet && state.permissionSet[k]) return true;
+  return false;
+}
+
+function hasAddon(k) {
+  if (!k) return true;
+  if (state.addonSet && state.addonSet[k]) return true;
   return false;
 }
 
@@ -99,6 +109,41 @@ function updateInboxUnreadIndicators() {
   const hasUnread = Array.isArray(state.conversations) && state.conversations.some((c) => Number(c && c.is_unread || 0) === 1);
   const dot = el('navInboxDot');
   if (dot) dot.style.display = hasUnread ? '' : 'none';
+}
+
+function wireMobileNavDrawer() {
+  const openBtn = el('navHamburger');
+  const overlay = el('navOverlay');
+  const aside = document.querySelector('aside.nav');
+  if (!openBtn || !overlay || !aside) return;
+
+  const close = () => {
+    try { document.documentElement.classList.remove('nav-open'); } catch {}
+  };
+  const open = () => {
+    try { document.documentElement.classList.add('nav-open'); } catch {}
+  };
+  const toggle = () => {
+    const on = document.documentElement.classList.contains('nav-open');
+    if (on) close(); else open();
+  };
+
+  if (!openBtn.dataset.wired) {
+    openBtn.dataset.wired = '1';
+    openBtn.addEventListener('click', () => toggle());
+  }
+
+  if (!overlay.dataset.wired) {
+    overlay.dataset.wired = '1';
+    overlay.addEventListener('click', () => close());
+  }
+
+  if (!aside.dataset.wiredMobileNav) {
+    aside.dataset.wiredMobileNav = '1';
+    aside.querySelectorAll('a[href^="#"]').forEach((a) => {
+      a.addEventListener('click', () => close());
+    });
+  }
 }
 
 function maybeNotifyNewSms(convs) {
@@ -227,7 +272,7 @@ function renderRbacRoleEditor() {
     const checked = keySet[k] ? 'checked' : '';
     const dis = locked ? 'disabled' : '';
     return `<div class="item"><label class="small" style="display:flex;gap:10px;align-items:center"><input type="checkbox" data-rp="1" data-k="${escapeHtml(k)}" ${checked} ${dis}><span><strong>${escapeHtml(k)}</strong><div class="small" style="margin-top:4px">${escapeHtml(lbl)}</div></span></label></div>`;
-  }).join('');
+  }).join('') || '<div class="item"><div class="small">No permissions</div></div>';
 }
 
 function openNewRoleModal() {
@@ -371,6 +416,89 @@ function renderUsersList() {
   });
 }
 
+function wireCustomFieldsSettings() {
+  const tagInput = el('newTagName');
+  const tagBtn = el('addTagBtn');
+  if (tagBtn && !tagBtn.dataset.wired) {
+    tagBtn.dataset.wired = '1';
+    tagBtn.addEventListener('click', async () => {
+      const name = String(tagInput ? tagInput.value : '').trim();
+      if (!name) {
+        toastError('Enter a tag name');
+        return;
+      }
+      try {
+        tagBtn.disabled = true;
+        await apiPost('/api/crm/tags/add', { name });
+        if (tagInput) tagInput.value = '';
+        await loadCrmLists();
+        refreshCrmDropdowns();
+        renderTagsAdmin();
+        toastSuccess('Added');
+      } catch (e) {
+        toastError(e && e.message ? e.message : String(e));
+      } finally {
+        tagBtn.disabled = false;
+      }
+    });
+  }
+
+  const groupInput = el('newGroupName');
+  const groupBtn = el('addGroupBtn');
+  if (groupBtn && !groupBtn.dataset.wired) {
+    groupBtn.dataset.wired = '1';
+    groupBtn.addEventListener('click', async () => {
+      const name = String(groupInput ? groupInput.value : '').trim();
+      if (!name) {
+        toastError('Enter a group name');
+        return;
+      }
+      try {
+        groupBtn.disabled = true;
+        await apiPost('/api/crm/groups/add', { name });
+        if (groupInput) groupInput.value = '';
+        await loadCrmLists();
+        refreshCrmDropdowns();
+        renderGroupsAdmin();
+        toastSuccess('Added');
+      } catch (e) {
+        toastError(e && e.message ? e.message : String(e));
+      } finally {
+        groupBtn.disabled = false;
+      }
+    });
+  }
+
+  const cfKey = el('newContactFieldKey');
+  const cfLabel = el('newContactFieldLabel');
+  const cfBtn = el('addContactFieldBtn');
+  if (cfBtn && !cfBtn.dataset.wired) {
+    cfBtn.dataset.wired = '1';
+    cfBtn.addEventListener('click', async () => {
+      const fieldKey = String(cfKey ? cfKey.value : '').trim();
+      const label = String(cfLabel ? cfLabel.value : '').trim();
+      if (!fieldKey || !label) {
+        toastError('Enter field_key and label');
+        return;
+      }
+      try {
+        cfBtn.disabled = true;
+        await apiPost('/api/contacts/fields/add', { field_key: fieldKey, label });
+        if (cfKey) cfKey.value = '';
+        if (cfLabel) cfLabel.value = '';
+        await loadContactFields();
+        renderContactFieldsAdmin();
+        renderBroadcastMergeFields();
+        toastSuccess('Added');
+      } catch (e) {
+        toastError(e && e.message ? e.message : String(e));
+      } finally {
+        cfBtn.disabled = false;
+      }
+    });
+  }
+}
+
 function wireRbacUi() {
   if (wireRbacUi._wired) return;
   wireRbacUi._wired = true;
@@ -457,6 +585,28 @@ function wireRbacUi() {
   }
 }
 
+function wireBroadcastScheduleUi() {
+  const mode = el('broadcastSendMode');
+  const box = el('broadcastScheduleBox');
+  const sendBtn = el('broadcastSendBtn');
+  if (!mode || !box || !sendBtn) return;
+  const apply = () => {
+    const v = String(mode.value || 'now');
+    box.style.display = v === 'schedule' ? '' : 'none';
+    sendBtn.textContent = v === 'schedule' ? 'Schedule' : 'Send';
+  };
+  mode.addEventListener('change', apply);
+  apply();
+}
+
+function wireTwilioOptionalInfo() {
+  const b = el('twilioOptionalInfo');
+  if (!b) return;
+  b.addEventListener('click', () => {
+    toastInfo('API SID/Secret + TwiML App SID are required for browser calling. Default From Number is used as a fallback when a conversation/number does not specify a from number. If you omit these fields, SMS may still work but calling or fallbacks may fail.');
+  });
+}
+
 function wireNotifRulesUi() {
   if (wireNotifRulesUi._wired) return;
   wireNotifRulesUi._wired = true;
@@ -501,9 +651,16 @@ async function loadMe() {
     state.permissions = perms;
     state.permissionSet = {};
     perms.forEach((k) => { state.permissionSet[String(k)] = true; });
+
+    const addons = data && Array.isArray(data.addons) ? data.addons : [];
+    state.addons = addons;
+    state.addonSet = {};
+    addons.forEach((k) => { state.addonSet[String(k)] = true; });
   } catch {
     state.permissions = [];
     state.permissionSet = {};
+    state.addons = [];
+    state.addonSet = {};
   }
 }
 
@@ -521,10 +678,16 @@ function applyNavPermissions() {
     navUsers: 'users.manage',
     navRoles: 'users.manage'
   };
+  const addonMap = {
+    navBroadcast: 'broadcasting',
+    navUsers: 'rbac',
+    navRoles: 'rbac',
+  };
   Object.entries(map).forEach(([id, perm]) => {
     const a = el(id);
     if (!a) return;
-    a.style.display = hasPerm(perm) ? '' : 'none';
+    const addonKey = addonMap[id] || '';
+    a.style.display = (hasPerm(perm) && hasAddon(addonKey)) ? '' : 'none';
   });
 }
 
@@ -589,6 +752,178 @@ function renderSmsCounter(text, hostId) {
   host.textContent = `${m.length} characters • ${m.segments} segment${m.segments === 1 ? '' : 's'} • ${m.gsm ? 'GSM-7' : 'Unicode'}`;
 }
 
+async function loadAdminAddons() {
+  const list = el('addonsList');
+  if (list) list.innerHTML = '<div class="item"><div class="small">Loading...</div></div>';
+  const data = await apiGet('/api/admin/addons');
+  const addons = data && Array.isArray(data.addons) ? data.addons : [];
+  if (!list) return;
+  if (addons.length === 0) {
+    list.innerHTML = '<div class="small">No addons registered.</div>';
+    return;
+  }
+  list.innerHTML = addons.map((a) => {
+    const k = escapeHtml(String(a.key || ''));
+    const label = escapeHtml(String(a.label || a.key || ''));
+    const enabled = !!a.enabled;
+    const comingSoon = !!a.coming_soon;
+    const url = String(a.url || '').trim();
+    const buyUrl = String(a.buy_url || '').trim();
+    const checked = enabled ? 'checked' : '';
+    const installedBadge = comingSoon
+      ? '<span class="badge">Coming soon</span>'
+      : (enabled ? '<span class="badge">Installed</span>' : '<span class="badge">Not installed</span>');
+    const links = [
+      url ? `<a class="btn" href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer">Details</a>` : '',
+      buyUrl ? `<a class="btn primary" href="${escapeHtml(buyUrl)}" target="_blank" rel="noopener noreferrer">Buy</a>` : '',
+    ].filter(Boolean).join(' ');
+    return `<div class="item" style="display:flex;align-items:center;justify-content:space-between;gap:10px">
+      <div style="min-width:0">
+        <div><strong>${label}</strong> ${installedBadge}</div>
+        <div class="small" style="margin-top:4px">${k}</div>
+        ${links ? `<div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap">${links}</div>` : ''}
+      </div>
+      ${comingSoon ? '<div class="small" style="opacity:.75">Coming soon</div>' : `
+      <label class="small" style="display:flex;align-items:center;gap:8px;white-space:nowrap">
+        <input type="checkbox" data-addon-toggle="1" data-k="${k}" ${checked}>
+        Enabled
+      </label>`}
+    </div>`;
+  }).join('');
+
+  list.querySelectorAll('[data-addon-toggle="1"]').forEach((cb) => {
+    cb.addEventListener('change', async () => {
+      const key = String(cb.getAttribute('data-k') || '').trim();
+      if (!key) return;
+      const enabled = !!cb.checked;
+      cb.disabled = true;
+      try {
+        await apiPost('/api/admin/addons', { key, enabled });
+        await loadMe();
+        applyNavPermissions();
+        const cur = (String(window.location.hash || '').replace('#', '') || 'analytics');
+        await setActiveNav(cur).catch(() => {});
+        toastSuccess('Saved');
+      } catch (e) {
+        cb.checked = !enabled;
+        toastError(e && e.message ? e.message : String(e));
+      } finally {
+        cb.disabled = false;
+      }
+    });
+  });
+}
+
+function wireAddonsSettings() {
+  const refresh = el('refreshAddons');
+  if (refresh) refresh.addEventListener('click', () => loadAdminAddons().catch(() => {}));
+}
+
+function wireLicensesSettings() {
+  const refreshLic = el('refreshLicenses');
+  if (refreshLic) {
+    refreshLic.addEventListener('click', async () => {
+      try {
+        refreshLic.disabled = true;
+        await Promise.all([
+          loadAdminUpdateInfo().catch(() => {}),
+          loadAdminLicenses().catch(() => {})
+        ]);
+        toastSuccess('Refreshed');
+      } catch {
+      } finally {
+        refreshLic.disabled = false;
+      }
+    });
+  }
+}
+
+async function loadAdminUpdateInfo() {
+  const host = el('updateInfoSummary');
+  if (!host) return;
+  host.textContent = 'Checking for updates...';
+  try {
+    const data = await apiGet('/api/admin/licenses/update-info');
+    const appVersion = String((data && data.app_version) ? data.app_version : '').trim();
+    const upd = (data && data.update) ? data.update : null;
+    const status = upd && typeof upd === 'object' ? !!upd.status : false;
+    const newVer = upd && upd.data ? String(upd.data.new_version || '').trim() : '';
+    const url = upd && upd.data ? String(upd.data.url || '').trim() : '';
+    if (!status || !newVer) {
+      host.textContent = appVersion ? `App version: ${appVersion}` : '';
+      return;
+    }
+    let text = appVersion ? `App version: ${appVersion} • Latest: ${newVer}` : `Latest: ${newVer}`;
+    if (url) text += ' • See details';
+    host.textContent = text;
+    if (url) {
+      host.innerHTML = `${escapeHtml(text.replace(' • See details', ''))} • <a href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer">See details</a>`;
+    }
+  } catch (e) {
+    host.textContent = '';
+  }
+}
+
+async function loadAdminLicenses() {
+  const host = el('licensesList');
+  const summary = el('coreLicenseSummary');
+  if (host) host.innerHTML = '<div class="item"><div class="small">Loading...</div></div>';
+  const data = await apiGet('/api/admin/licenses');
+  const rows = data && Array.isArray(data.licenses) ? data.licenses : [];
+  if (!host) return;
+  const core = rows.find((x) => String(x.scope || '') === 'core');
+  if (summary) {
+    if (!core) {
+      summary.textContent = 'Core license: unknown';
+    } else {
+      const ok = !!core.is_valid;
+      const title = String(core.license_title || core.product_base || '').trim();
+      const exp = String(core.expire_date || '').trim();
+      const sup = String(core.support_end || '').trim();
+      const checked = String(core.last_checked_at || '').trim();
+      const parts = [
+        `Core license: ${ok ? 'activated' : 'not active'}`,
+        title ? title : '',
+        exp ? `expires ${exp}` : 'expires No expiry',
+        sup ? `support until ${sup}` : 'support until Unlimited',
+        checked ? `checked ${checked}` : ''
+      ].filter(Boolean);
+      summary.textContent = parts.join(' • ');
+    }
+  }
+
+  const listRows = rows.filter((r) => String(r.scope || '') !== 'core');
+
+  const listHtml = listRows.map((r) => {
+    const scope = escapeHtml(String(r.scope || ''));
+    const pid = escapeHtml(String(r.product_id || ''));
+    const pb = escapeHtml(String(r.product_base || ''));
+    const valid = !!r.is_valid;
+    const badge = valid ? '<span class="badge">valid</span>' : '<span class="badge">invalid</span>';
+    const title = escapeHtml(String(r.license_title || ''));
+    const exp = escapeHtml(String(r.expire_date || ''));
+    const support = escapeHtml(String(r.support_end || ''));
+    const checkedAt = escapeHtml(String(r.last_checked_at || ''));
+    const err = escapeHtml(String(r.last_error || ''));
+    const meta = [
+      title ? title : '',
+      exp ? `expires ${exp}` : '',
+      support ? `support ${support}` : '',
+      checkedAt ? `checked ${checkedAt}` : '',
+    ].filter(Boolean).join(' • ');
+    return `<div class="item" style="display:flex;align-items:center;justify-content:space-between;gap:10px">
+      <div style="min-width:0">
+        <div><strong>${scope}</strong> ${badge}</div>
+        <div class="small" style="margin-top:4px">${pid} • ${pb}</div>
+        ${meta ? `<div class="small" style="margin-top:4px">${meta}</div>` : ''}
+        ${(!valid && err) ? `<div class="small" style="margin-top:4px">${err}</div>` : ''}
+      </div>
+    </div>`;
+  }).join('');
+
+  host.innerHTML = listHtml || '<div class="item"><div class="small">No addon licenses</div></div>';
+}
+
 async function loadAnalyticsQuick(hostId) {
   const host = el(hostId);
   if (!host) return;
@@ -625,6 +960,141 @@ function wireSettingsTabs() {
   const sections = Array.from(document.querySelectorAll('.settingsSection[data-stab]'));
   if (buttons.length === 0 || sections.length === 0) return;
 
+  const wireTabRefreshButtons = () => {
+    const t = el('refreshSettingsTwilio');
+    if (t && !t.dataset.wired) {
+      t.dataset.wired = '1';
+      t.addEventListener('click', async () => {
+        try {
+          t.disabled = true;
+          await Promise.all([
+            loadTwilioAccounts().catch(() => {}),
+            loadDefaultTwilioSettings().catch(() => {}),
+            loadNumbersAdmin().catch(() => {})
+          ]);
+          toastSuccess('Refreshed');
+        } catch (e) {
+          toastError(e && e.message ? e.message : String(e));
+        } finally {
+          t.disabled = false;
+        }
+      });
+    }
+
+    const eBtn = el('refreshSettingsEmail');
+    if (eBtn && !eBtn.dataset.wired) {
+      eBtn.dataset.wired = '1';
+      eBtn.addEventListener('click', async () => {
+        try {
+          eBtn.disabled = true;
+          await loadSmtpSettings();
+          toastSuccess('Refreshed');
+        } catch (e) {
+          toastError(e && e.message ? e.message : String(e));
+        } finally {
+          eBtn.disabled = false;
+        }
+      });
+    }
+
+    const vBtn = el('refreshSettingsVoice');
+    if (vBtn && !vBtn.dataset.wired) {
+      vBtn.dataset.wired = '1';
+      vBtn.addEventListener('click', async () => {
+        try {
+          vBtn.disabled = true;
+          await loadVoiceRouting();
+          toastSuccess('Refreshed');
+        } catch (e) {
+          toastError(e && e.message ? e.message : String(e));
+        } finally {
+          vBtn.disabled = false;
+        }
+      });
+    }
+
+    const gBtn = el('refreshSettingsGeneral');
+    if (gBtn && !gBtn.dataset.wired) {
+      gBtn.dataset.wired = '1';
+      gBtn.addEventListener('click', async () => {
+        try {
+          gBtn.disabled = true;
+          await Promise.all([
+            loadAdminUpdateInfo().catch(() => {}),
+            loadAdminLicenses().catch(() => {}),
+            loadTimezoneSettings().catch(() => {})
+          ]);
+          toastSuccess('Refreshed');
+        } catch (e) {
+          toastError(e && e.message ? e.message : String(e));
+        } finally {
+          gBtn.disabled = false;
+        }
+      });
+    }
+
+    const aBtn = el('refreshSettingsAutomations');
+    if (aBtn && !aBtn.dataset.wired) {
+      aBtn.dataset.wired = '1';
+      aBtn.addEventListener('click', async () => {
+        try {
+          aBtn.disabled = true;
+          await Promise.all([
+            loadOptOutSettings().catch(() => {}),
+            loadNotifRules().catch(() => {}),
+          ]);
+          try { syncNotifRuleEditor(); } catch {}
+          toastSuccess('Refreshed');
+        } catch (e) {
+          toastError(e && e.message ? e.message : String(e));
+        } finally {
+          aBtn.disabled = false;
+        }
+      });
+    }
+
+    const adBtn = el('refreshSettingsAddons');
+    if (adBtn && !adBtn.dataset.wired) {
+      adBtn.dataset.wired = '1';
+      adBtn.addEventListener('click', async () => {
+        try {
+          adBtn.disabled = true;
+          await loadAdminAddons();
+          toastSuccess('Refreshed');
+        } catch (e) {
+          toastError(e && e.message ? e.message : String(e));
+        } finally {
+          adBtn.disabled = false;
+        }
+      });
+    }
+
+    const cfBtn = el('refreshSettingsCustomFields');
+    if (cfBtn && !cfBtn.dataset.wired) {
+      cfBtn.dataset.wired = '1';
+      cfBtn.addEventListener('click', async () => {
+        try {
+          cfBtn.disabled = true;
+          await Promise.all([
+            loadCrmLists().catch(() => {}),
+            loadContactFields().catch(() => {}),
+          ]);
+          refreshCrmDropdowns();
+          renderTagsAdmin();
+          renderGroupsAdmin();
+          renderContactFieldsAdmin();
+          toastSuccess('Refreshed');
+        } catch (e) {
+          toastError(e && e.message ? e.message : String(e));
+        } finally {
+          cfBtn.disabled = false;
+        }
+      });
+    }
+  };
+
+  wireTabRefreshButtons();
+
   const show = (stab) => {
     sections.forEach((s) => {
       const k = String(s.getAttribute('data-stab') || '');
@@ -635,6 +1105,17 @@ function wireSettingsTabs() {
       if (k === stab) b.classList.add('primary');
       else b.classList.remove('primary');
     });
+
+    if (stab === 'addons') {
+      loadAdminAddons().catch(() => {});
+      try { wireAddonsSettings(); } catch {}
+    }
+
+    if (stab === 'general') {
+      loadAdminUpdateInfo().catch(() => {});
+      loadAdminLicenses().catch(() => {});
+      try { wireLicensesSettings(); } catch {}
+    }
   };
 
   buttons.forEach((b) => {
@@ -957,8 +1438,239 @@ function wireBroadcastTabs() {
       s.style.display = String(s.dataset.btab) === tab ? '' : 'none';
     });
   };
-  buttons.forEach((b) => b.addEventListener('click', () => setTab(String(b.dataset.btab || 'campaigns'))));
-  setTab('campaigns');
+  buttons.forEach((b) => b.addEventListener('click', () => setTab(String(b.dataset.btab || 'send'))));
+  setTab('send');
+
+  const refreshJobsBtn = el('broadcastJobsRefresh');
+  if (refreshJobsBtn && !refreshJobsBtn.dataset.wired) {
+    refreshJobsBtn.dataset.wired = '1';
+    refreshJobsBtn.addEventListener('click', async () => {
+      try {
+        await loadBroadcastJobs();
+        renderBroadcastJobsHistory();
+        renderBroadcastJobSelect();
+        toastSuccess('Refreshed');
+      } catch (e) {
+        toastError(e && e.message ? e.message : String(e));
+      }
+    });
+  }
+
+  const jobSel = el('broadcastJobSelect');
+  if (jobSel && !jobSel.dataset.wired) {
+    jobSel.dataset.wired = '1';
+    jobSel.addEventListener('change', async () => {
+      const id = Number(jobSel.value || 0) || 0;
+      if (!id) {
+        state.broadcastJobAnalytics = null;
+        renderBroadcastJobAnalytics();
+        return;
+      }
+      try {
+        await loadBroadcastJobAnalytics(id);
+        renderBroadcastJobAnalytics();
+      } catch (e) {
+        toastError(e && e.message ? e.message : String(e));
+      }
+    });
+  }
+
+  const jobRefreshBtn = el('broadcastJobRefresh');
+  if (jobRefreshBtn && !jobRefreshBtn.dataset.wired) {
+    jobRefreshBtn.dataset.wired = '1';
+    jobRefreshBtn.addEventListener('click', async () => {
+      const sel = el('broadcastJobSelect');
+      const id = sel ? (Number(sel.value || 0) || 0) : 0;
+      if (!id) {
+        toastError('Select a campaign');
+        return;
+      }
+      try {
+        await loadBroadcastJobAnalytics(id);
+        renderBroadcastJobAnalytics();
+        toastSuccess('Refreshed');
+      } catch (e) {
+        toastError(e && e.message ? e.message : String(e));
+      }
+    });
+  }
+}
+
+async function loadBroadcastJobs() {
+  const data = await apiGet('/api/broadcast/jobs?limit=200&offset=0');
+  state.broadcastJobs = Array.isArray(data && data.jobs) ? data.jobs : [];
+  return state.broadcastJobs;
+}
+
+async function loadBroadcastJobAnalytics(jobId) {
+  const id = Number(jobId || 0) || 0;
+  if (!id) {
+    state.broadcastJobAnalytics = null;
+    return null;
+  }
+  const data = await apiGet(`/api/broadcast/job?id=${encodeURIComponent(String(id))}`);
+  state.broadcastJobAnalytics = data;
+  return data;
+}
+
+function renderBroadcastJobsHistory() {
+  const list = el('broadcastJobsList');
+  if (!list) return;
+  const jobs = Array.isArray(state.broadcastJobs) ? state.broadcastJobs : [];
+  if (jobs.length === 0) {
+    list.innerHTML = '<div class="item"><div class="small">No campaigns yet</div></div>';
+    return;
+  }
+  list.innerHTML = jobs.map((j) => {
+    const id = Number(j.id);
+    const status = escapeHtml(String(j.status || ''));
+    const when = escapeHtml(fmtWhen(j.created_at || j.scheduled_at_utc || ''));
+    const from = escapeHtml(String(j.from_number || ''));
+    const mode = escapeHtml(String(j.mode || ''));
+    const total = Number(j.total_count || 0) || 0;
+    const sent = Number(j.sent_count || 0) || 0;
+    const failed = Number(j.failed_count || 0) || 0;
+    const opted = Number(j.opted_out_count || 0) || 0;
+    const body = escapeHtml(String(j.body || '')).slice(0, 140);
+    const line2 = `${sent}/${total} sent${failed ? `, ${failed} failed` : ''}${opted ? `, ${opted} opted-out` : ''}`;
+    const stRaw = String(j.status || '');
+    const canCancel = stRaw === 'scheduled' || stRaw === 'running';
+    return `<div class="item" data-bjobid="${id}">
+      <div class="row" style="align-items:flex-start;justify-content:space-between;gap:12px">
+        <div style="min-width:0;flex:1">
+          <div><strong>#${id}</strong> <span class="badge">${status || 'unknown'}</span></div>
+          <div class="small" style="margin-top:6px">${when} ${from ? `• From: ${from}` : ''} ${mode ? `• ${mode}` : ''}</div>
+          <div class="small" style="margin-top:6px">${escapeHtml(line2)}</div>
+          <div class="small" style="margin-top:6px">${body}${String(j.body || '').length > 140 ? '...' : ''}</div>
+        </div>
+        <div class="row" style="gap:8px;flex-wrap:wrap">
+          <button class="btn" type="button" data-bjobview="1" data-id="${id}">View analytics</button>
+          ${canCancel ? `<button class="btn danger" type="button" data-bjobcancel="1" data-id="${id}">Cancel</button>` : ''}
+        </div>
+      </div>
+    </div>`;
+  }).join('');
+
+  list.querySelectorAll('[data-bjobview="1"]').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const id = Number(btn.dataset.id || 0) || 0;
+      const sel = el('broadcastJobSelect');
+      if (sel && id) sel.value = String(id);
+      try {
+        await loadBroadcastJobAnalytics(id);
+        renderBroadcastJobAnalytics();
+        const tabs = el('broadcastTabs');
+        if (tabs) {
+          const analyticsBtn = tabs.querySelector('[data-btab="analytics"]');
+          if (analyticsBtn) analyticsBtn.click();
+        }
+      } catch (e) {
+        toastError(e && e.message ? e.message : String(e));
+      }
+    });
+  });
+
+  list.querySelectorAll('[data-bjobcancel="1"]').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const id = Number(btn.dataset.id || 0) || 0;
+      if (!id) return;
+      if (!confirm(`Cancel campaign #${id}?`)) return;
+      btn.disabled = true;
+      try {
+        await apiPost('/api/broadcast/cancel', { id });
+        await loadBroadcastJobs();
+        renderBroadcastJobsHistory();
+        const sel = el('broadcastJobSelect');
+        const curId = sel ? (Number(sel.value || 0) || 0) : 0;
+        if (curId === id) {
+          await loadBroadcastJobAnalytics(id).catch(() => {});
+          renderBroadcastJobAnalytics();
+        }
+        toastSuccess('Canceled');
+      } catch (e) {
+        toastError(e && e.message ? e.message : String(e));
+      } finally {
+        btn.disabled = false;
+      }
+    });
+  });
+}
+
+function renderBroadcastJobSelect() {
+  const sel = el('broadcastJobSelect');
+  if (!sel) return;
+  const jobs = Array.isArray(state.broadcastJobs) ? state.broadcastJobs : [];
+  sel.innerHTML = '<option value="">Select campaign</option>' + jobs.map((j) => {
+    const id = Number(j.id);
+    const status = escapeHtml(String(j.status || ''));
+    const when = escapeHtml(fmtWhen(j.created_at || j.scheduled_at_utc || ''));
+    return `<option value="${id}">#${id} • ${status} • ${when}</option>`;
+  }).join('');
+}
+
+function renderBroadcastJobAnalytics() {
+  const hostSummary = el('broadcastJobSummary');
+  const hostCounts = el('broadcastJobCounts');
+  const hostErrors = el('broadcastJobErrors');
+  const hostSample = el('broadcastJobSample');
+  if (!hostSummary || !hostCounts || !hostErrors || !hostSample) return;
+
+  const data = state.broadcastJobAnalytics;
+  if (!data || !data.job) {
+    hostSummary.innerHTML = '<div class="small">Select a campaign to view analytics.</div>';
+    hostCounts.innerHTML = '';
+    hostErrors.innerHTML = '';
+    hostSample.innerHTML = '';
+    return;
+  }
+
+  const j = data.job;
+  const id = Number(j.id);
+  const status = escapeHtml(String(j.status || ''));
+  const from = escapeHtml(String(j.from_number || ''));
+  const mode = escapeHtml(String(j.mode || ''));
+  const when = escapeHtml(fmtWhen(j.created_at || j.scheduled_at_utc || ''));
+  const body = escapeHtml(String(j.body || ''));
+  const total = Number(j.total_count || 0) || 0;
+  const sent = Number(j.sent_count || 0) || 0;
+  const failed = Number(j.failed_count || 0) || 0;
+  const opted = Number(j.opted_out_count || 0) || 0;
+  const lastError = escapeHtml(String(j.last_error || ''));
+
+  hostSummary.innerHTML = `<div class="card">
+    <div><strong>Campaign #${id}</strong> <span class="badge">${status || 'unknown'}</span></div>
+    <div class="small" style="margin-top:6px">${when}${from ? ` • From: ${from}` : ''}${mode ? ` • ${mode}` : ''}</div>
+    ${lastError ? `<div class="small" style="margin-top:6px"><strong>Last error:</strong> ${lastError}</div>` : ''}
+    <div class="small" style="margin-top:10px">${body}</div>
+  </div>`;
+
+  const counts = (data.counts && typeof data.counts === 'object') ? data.counts : {};
+  const countLine = (k, v) => `<div class="item"><div class="row" style="align-items:center;justify-content:space-between"><div><strong>${escapeHtml(k)}</strong></div><div>${escapeHtml(String(v))}</div></div></div>`;
+  const rendered = [
+    ['total', total],
+    ['sent', sent],
+    ['failed', failed],
+    ['opted_out', opted],
+  ];
+  Object.keys(counts).forEach((k) => {
+    if (!rendered.some((x) => x[0] === k)) rendered.push([k, Number(counts[k] || 0) || 0]);
+  });
+  hostCounts.innerHTML = `<div class="card"><div class="small" style="margin-bottom:10px">Counts</div><div class="list">${rendered.map(([k, v]) => countLine(k, v)).join('')}</div></div>`;
+
+  const errs = Array.isArray(data.top_errors) ? data.top_errors : [];
+  hostErrors.innerHTML = `<div class="card"><div class="small" style="margin-bottom:10px">Top errors</div>${errs.length ? `<div class="list">${errs.map((e) => {
+    const msg = escapeHtml(String(e.error || ''));
+    const c = escapeHtml(String(e.c || 0));
+    return `<div class="item"><div class="row" style="align-items:center;justify-content:space-between;gap:10px"><div class="small" style="min-width:0;flex:1">${msg}</div><div class="small">${c}</div></div></div>`;
+  }).join('')}</div>` : '<div class="small">No errors</div>'}</div>`;
+
+  const sample = Array.isArray(data.sample) ? data.sample : [];
+  hostSample.innerHTML = `<div class="card"><div class="small" style="margin-bottom:10px">Recent recipients</div>${sample.length ? `<div class="list">${sample.map((r) => {
+    const pn = escapeHtml(String(r.phone_number || ''));
+    const st = escapeHtml(String(r.status || ''));
+    const err = escapeHtml(String(r.error || ''));
+    return `<div class="item"><div class="row" style="align-items:center;justify-content:space-between;gap:10px"><div><strong>${pn}</strong> <span class="badge">${st}</span></div><div class="small">${err}</div></div></div>`;
+  }).join('')}</div>` : '<div class="small">No recipients</div>'}</div>`;
 }
 
 function wireBroadcastTemplatesManager() {
@@ -1270,6 +1982,18 @@ function wireBroadcast() {
     update();
   }
 
+  const throttleEnabled = el('broadcastThrottleEnabled');
+  const throttleBox = el('broadcastThrottleBox');
+  if (throttleEnabled && throttleBox && !throttleEnabled.dataset.wired) {
+    throttleEnabled.dataset.wired = '1';
+    const apply = () => {
+      const on = !!throttleEnabled.checked;
+      throttleBox.style.display = on ? '' : 'none';
+    };
+    throttleEnabled.addEventListener('change', apply);
+    apply();
+  }
+
   const mode = el('broadcastAudienceMode');
   const boxSearch = el('broadcastAudienceSearch');
   const boxGroup = el('broadcastAudienceGroup');
@@ -1399,6 +2123,49 @@ function wireBroadcast() {
       const fromNumberId = Number(el('broadcastFromNumber') ? el('broadcastFromNumber').value : 0) || 0;
       const bodyText = String(el('broadcastBody') ? el('broadcastBody').value : '').trim();
       if (!fromNumberId || !bodyText) return;
+
+      const throttlingOn = !!(el('broadcastThrottleEnabled') && el('broadcastThrottleEnabled').checked);
+      let batchSize = Number(el('broadcastBatchSize') ? el('broadcastBatchSize').value : 50) || 50;
+      let sendDelayMs = Number(el('broadcastSendDelayMs') ? el('broadcastSendDelayMs').value : 0) || 0;
+      if (batchSize < 1) batchSize = 1;
+      if (batchSize > 500) batchSize = 500;
+      if (sendDelayMs < 0) sendDelayMs = 0;
+      if (sendDelayMs > 5000) sendDelayMs = 5000;
+
+      const sendMode = String(el('broadcastSendMode') ? el('broadcastSendMode').value : 'now');
+      if (sendMode === 'schedule') {
+        const d = String(el('broadcastScheduleDate') ? el('broadcastScheduleDate').value : '').trim();
+        const t = String(el('broadcastScheduleTime') ? el('broadcastScheduleTime').value : '').trim();
+        if (!d || !t) {
+          toastError('Pick a schedule date and time');
+          return;
+        }
+        const modeV = String(el('broadcastAudienceMode') ? el('broadcastAudienceMode').value : 'all');
+        const q = String(el('broadcastQuery') ? el('broadcastQuery').value : '').trim();
+        const groupId = Number(el('broadcastGroupSelect') ? el('broadcastGroupSelect').value : 0) || 0;
+        const tagId = Number(el('broadcastTagSelect') ? el('broadcastTagSelect').value : 0) || 0;
+        const numbers = String(el('broadcastPasteNumbers') ? el('broadcastPasteNumbers').value : '');
+        try {
+          sendBtn.disabled = true;
+          const payload = { mode: modeV, q, group_id: groupId, tag_id: tagId, numbers, body: bodyText, from_number_id: fromNumberId, schedule_date: d, schedule_time: t };
+          if (throttlingOn) {
+            payload.batch_size = batchSize;
+            payload.send_delay_ms = sendDelayMs;
+          }
+          const res = await apiPost('/api/broadcast/schedule', payload);
+          if (res && res.scheduled_at_local && res.scheduled_tz) {
+            toastSuccess(`Scheduled for ${res.scheduled_at_local} ${res.scheduled_tz}`);
+          } else {
+            toastSuccess('Scheduled');
+          }
+        } catch (e) {
+          toastError(e && e.message ? e.message : String(e));
+        } finally {
+          sendBtn.disabled = false;
+        }
+        return;
+      }
+
       if (!confirm('Send broadcast now?')) return;
       const modeV = String(el('broadcastAudienceMode') ? el('broadcastAudienceMode').value : 'all');
       const q = String(el('broadcastQuery') ? el('broadcastQuery').value : '').trim();
@@ -1407,7 +2174,12 @@ function wireBroadcast() {
       const numbers = String(el('broadcastPasteNumbers') ? el('broadcastPasteNumbers').value : '');
       try {
         sendBtn.disabled = true;
-        const res = await apiPost('/api/broadcast/send', { mode: modeV, q, group_id: groupId, tag_id: tagId, numbers, body: bodyText, from_number_id: fromNumberId, dry_run: false });
+        const payload = { mode: modeV, q, group_id: groupId, tag_id: tagId, numbers, body: bodyText, from_number_id: fromNumberId, dry_run: false };
+        if (throttlingOn) {
+          payload.batch_size = batchSize;
+          payload.send_delay_ms = sendDelayMs;
+        }
+        const res = await apiPost('/api/broadcast/send', payload);
         toastSuccess(`Sent ${res && res.sent_count ? res.sent_count : ''}`.trim() || 'Sent');
       } catch (e) {
         toastError(e && e.message ? e.message : String(e));
@@ -1707,7 +2479,15 @@ function wireNewMessage() {
   const fromEl = el('newMessageFrom');
   const msgEl = el('newMessageText');
   const charCountEl = el('newMessageCharCount');
-  if (!btn || !panel || !cancel || !start || !toEl || !fromEl || !msgEl || !charCountEl) return;
+  if (!btn || !panel || !cancel || !start || !toEl || !fromEl) return;
+
+  if (msgEl && charCountEl) {
+    const update = () => {
+      try { renderSmsCounter(String(msgEl.value || ''), 'newMessageCharCount'); } catch {}
+    };
+    msgEl.addEventListener('input', update);
+    update();
+  }
 
   const open = () => {
     renderNewMessageFromNumbers();
@@ -1843,6 +2623,7 @@ function wireTwilioAccountsSettings() {
         await apiPost('/api/admin/twilio-accounts/add', payload);
         await loadTwilioAccounts();
         await loadNumbersAdmin();
+        await loadDefaultTwilioSettings().catch(() => {});
         toastSuccess('Saved');
       } catch (e) {
         toastError(e && e.message ? e.message : String(e));
@@ -2330,6 +3111,15 @@ function renderDialFromNumbers() {
 }
 
 async function setActiveNav(view) {
+  const viewAddons = {
+    broadcast: 'broadcasting',
+    users: 'rbac',
+    roles: 'rbac',
+  };
+  if (viewAddons[view] && !hasAddon(viewAddons[view])) {
+    toastError('Feature not enabled');
+    view = 'analytics';
+  }
   const needs = {
     analytics: 'analytics.view',
     inbox: 'inbox.view',
@@ -2347,6 +3137,8 @@ async function setActiveNav(view) {
     toastError('Forbidden');
     view = 'analytics';
   }
+
+  try { document.documentElement.dataset.view = String(view || ''); } catch {}
   const views = {
     analytics: el('viewAnalytics'),
     inbox: el('viewInbox'),
@@ -2461,6 +3253,12 @@ async function setActiveNav(view) {
       renderInboxTemplates();
       renderBroadcastTemplatesManagerList();
     }).catch(() => {});
+
+    loadBroadcastJobs().then(() => {
+      renderBroadcastJobsHistory();
+      renderBroadcastJobSelect();
+      renderBroadcastJobAnalytics();
+    }).catch(() => {});
   }
   if (view === 'voicemails') {
     loadVoicemails().catch(() => {});
@@ -2471,6 +3269,7 @@ async function setActiveNav(view) {
 function wireNavigation() {
   const applyFromHash = () => {
     const h = String(window.location.hash || '').replace('#', '');
+    try { document.documentElement.dataset.view = String(h || 'analytics'); } catch {}
     if (h === '' || h === 'analytics') return setActiveNav('analytics');
     if (h === 'broadcast') return setActiveNav('broadcast');
     if (h === 'inbox') return setActiveNav('inbox');
@@ -3132,6 +3931,7 @@ function renderNumbersAdmin() {
       <div style="margin-top:10px">${assignedBadges}</div>
       <div style="margin-top:12px" class="row" >
         <button class="btn primary" type="button" data-saveall="1">Save</button>
+        <button class="btn" type="button" data-delnumber="1">Delete</button>
       </div>
     </div>`;
   }).join('');
@@ -3185,6 +3985,29 @@ function renderNumbersAdmin() {
       }
     });
   });
+
+  list.querySelectorAll('[data-delnumber="1"]').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const item = btn.closest('.item');
+      if (!item) return;
+
+      const id = Number(item.dataset.nid || 0);
+      if (!id) return;
+
+      if (!confirm('Delete this number?')) return;
+
+      try {
+        btn.disabled = true;
+        await apiPost('/api/admin/numbers/delete', { id });
+        toastSuccess('Deleted');
+        await loadNumbersAdmin();
+      } catch (e) {
+        toastError(e && e.message ? e.message : String(e));
+      } finally {
+        btn.disabled = false;
+      }
+    });
+  });
 }
 
 async function loadNumbersAdmin() {
@@ -3219,6 +4042,17 @@ async function loadDefaultTwilioSettings() {
     sel.innerHTML = '<option value="0">(env / none)</option>' + accounts.map((a) => `<option value="${Number(a.id)}">${escapeHtml(a.name || '')}</option>`).join('');
     const v = Number(data.default_twilio_account_id || 0);
     sel.value = String(v > 0 ? v : 0);
+
+    const card = el('defaultTwilioCard');
+    if (card) {
+      if (v > 0) {
+        card.style.borderColor = '';
+        card.style.boxShadow = '';
+      } else {
+        card.style.borderColor = 'rgba(91,140,255,.55)';
+        card.style.boxShadow = '0 0 0 3px rgba(91,140,255,.15)';
+      }
+    }
   } catch (e) {
   }
 }
@@ -3230,8 +4064,6 @@ async function saveDefaultTwilioSettings() {
 }
 
 function wireDefaultTwilioSettings() {
-  const r = el('refreshDefaultTwilio');
-  if (r) r.addEventListener('click', () => loadDefaultTwilioSettings().catch(() => {}));
   const s = el('saveDefaultTwilio');
   if (s) {
     s.addEventListener('click', async () => {
@@ -3361,13 +4193,17 @@ function renderAdminUsers() {
           <div>${email}</div>
           <div class="small" style="margin-top:6px">Role: ${role}</div>
         </div>
-        <div class="row">
+        <div class="row" style="gap:10px;flex-wrap:wrap">
           <select class="input" id="userRole_${id}" name="userRole_${id}" data-role="1" style="max-width:140px">
             <option value="agent" ${role === 'agent' ? 'selected' : ''}>agent</option>
             <option value="admin" ${role === 'admin' ? 'selected' : ''}>admin</option>
           </select>
-          <button class="btn" data-setrole="1" type="button">Save</button>
         </div>
+      </div>
+      <div style="height:10px"></div>
+      <div class="row">
+        <input class="input" data-email="1" value="${email}" placeholder="Email" style="flex:1">
+        <button class="btn" data-saveuser="1" type="button">Save</button>
       </div>
       <div style="height:10px"></div>
       <div class="row">
@@ -3376,23 +4212,6 @@ function renderAdminUsers() {
       </div>
     </div>`;
   }).join('');
-
-  list.querySelectorAll('[data-setrole="1"]').forEach((btn) => {
-    btn.addEventListener('click', async () => {
-      const item = btn.closest('.item');
-      if (!item) return;
-      const id = Number(item.dataset.id || 0);
-      const sel = item.querySelector('[data-role="1"]');
-      const role = sel ? sel.value : 'agent';
-      try {
-        await apiPost('/api/admin/users/set-role', { id, role });
-        await loadAdminUsers();
-        toastSuccess('Saved');
-      } catch (e) {
-        toastError(e && e.message ? e.message : String(e));
-      }
-    });
-  });
 
   list.querySelectorAll('[data-resetpass="1"]').forEach((btn) => {
     btn.addEventListener('click', async () => {
@@ -3407,6 +4226,30 @@ function renderAdminUsers() {
         toastSuccess('Password reset');
       } catch (e) {
         toastError(e && e.message ? e.message : String(e));
+      }
+    });
+  });
+
+  list.querySelectorAll('[data-saveuser="1"]').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const item = btn.closest('.item');
+      if (!item) return;
+      const id = Number(item.dataset.id || 0);
+      const sel = item.querySelector('[data-role="1"]');
+      const role = sel ? sel.value : 'agent';
+      const input = item.querySelector('[data-email="1"]');
+      const email = String(input ? input.value : '').trim();
+      if (!id || !email) return;
+      try {
+        btn.disabled = true;
+        await apiPost('/api/admin/users/set-role', { id, role });
+        await apiPost('/api/admin/users/set-email', { id, email });
+        await loadAdminUsers();
+        toastSuccess('Saved');
+      } catch (e) {
+        toastError(e && e.message ? e.message : String(e));
+      } finally {
+        btn.disabled = false;
       }
     });
   });
@@ -3729,8 +4572,9 @@ function hideIncomingModal() {
   modal.style.display = 'none';
 }
 
-async function getToken() {
-  const res = await fetch('/api/voice/token', { headers: { 'Accept': 'application/json' } });
+async function getToken(fromNumberId) {
+  const qs = fromNumberId ? `?from_number_id=${encodeURIComponent(String(fromNumberId))}` : '';
+  const res = await fetch('/api/voice/token' + qs, { headers: { 'Accept': 'application/json' } });
   if (!res.ok) {
     const text = await res.text();
     try {
@@ -4271,7 +5115,9 @@ async function initVoice() {
   setStatus('Fetching token...');
   let token;
   try {
-    const t = await getToken();
+    const fromSel = el('dialFromNumberSelect');
+    const fromNumberId = fromSel && fromSel.value ? Number(fromSel.value) : 0;
+    const t = await getToken(fromNumberId || 0);
     token = t.token;
   } catch (e) {
     setStatus('Voice token error: ' + (e && e.message ? e.message : String(e)));
@@ -4322,6 +5168,23 @@ function wireCalling() {
   if (!callBtn || !dialInput) return;
 
   const fromSel = el('dialFromNumberSelect');
+
+  if (fromSel && !fromSel.dataset.voiceFromWired) {
+    fromSel.dataset.voiceFromWired = '1';
+    fromSel.addEventListener('change', async () => {
+      try {
+        if (device && typeof device.destroy === 'function') {
+          device.destroy();
+        }
+      } catch {
+      }
+      device = null;
+      try {
+        await initVoice();
+      } catch {
+      }
+    });
+  }
 
   callBtn.addEventListener('click', async () => {
     const to = normalizeE164(dialInput.value);
@@ -4423,9 +5286,16 @@ window.addEventListener('load', async () => {
   safeCall(rightPanelInit);
   safeCall(() => setStatus('Not initialized'));
 
+  try { document.documentElement.classList.remove('nav-open'); } catch {}
+
   if (!window.location.hash) {
     window.location.hash = '#inbox';
   }
+
+  try {
+    const h = String(window.location.hash || '').replace('#', '') || 'analytics';
+    document.documentElement.dataset.view = h;
+  } catch {}
 
   await safeAwait(loadMe());
   safeCall(applyNavPermissions);
@@ -4437,9 +5307,11 @@ window.addEventListener('load', async () => {
   }
 
   safeCall(wireNavigation);
+  safeCall(wireMobileNavDrawer);
   safeCall(wireAnalytics);
   safeCall(wireDialpadAnalytics);
   safeCall(wireBroadcast);
+  safeCall(wireBroadcastScheduleUi);
   safeCall(wireBroadcastTabs);
   safeCall(wireBroadcastTemplatesManager);
   safeCall(wireSettingsTabs);
@@ -4461,6 +5333,7 @@ window.addEventListener('load', async () => {
   safeCall(wireVoicemails);
   safeCall(wireCalls);
   safeCall(wireDefaultTwilioSettings);
+  safeCall(wireTwilioOptionalInfo);
   safeCall(wireWebhooksInfo);
   safeCall(() => { if (typeof wireCallDtmfPad === 'function') wireCallDtmfPad(); });
   safeCall(() => { if (typeof wireDialPad === 'function') wireDialPad(); });

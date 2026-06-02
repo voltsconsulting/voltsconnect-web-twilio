@@ -1,0 +1,16 @@
+# Normalize line endings
+* text=auto
+
+# Keep PHP and JS files as LF
+*.php text eol=lf
+*.js text eol=lf
+*.css text eol=lf
+*.md text eol=lf
+*.json text eol=lf
+*.sql text eol=lf
+
+# Binary files
+*.zip binary
+*.png binary
+*.jpg binary
+*.gif binary

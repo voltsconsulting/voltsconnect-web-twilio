@@ -1,6 +1,6 @@
 :root{--bg:#0b1220;--bg2:#0e1730;--panel:#121b2d;--panel2:#0f1728;--text:#e8eefc;--muted:#9db0d4;--accent:#5b8cff;--danger:#ff5b6b;--border:rgba(255,255,255,.08);--shadow:0 14px 50px rgba(0,0,0,.35);--bubbleIn:rgba(255,255,255,.08);--bubbleOut:rgba(91,140,255,.28)}
 [data-theme="light"]{--bg:#ffffff;--bg2:#ffffff;--panel:#ffffff;--panel2:#ffffff;--text:#111827;--muted:#5b6477;--accent:#2f6bff;--danger:#e11d48;--border:rgba(17,24,39,.12);--shadow:0 14px 50px rgba(17,24,39,.12);--bubbleIn:rgba(17,24,39,.06);--bubbleOut:rgba(47,107,255,.16)}
-*{box-sizing:border-box}html,body{height:100%}body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;background:var(--bg);color:var(--text)}
+*{box-sizing:border-box}html,body{height:100%}body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;background:var(--bg);color:var(--text);overflow-y:auto}
 .container{max-width:720px;margin:0 auto;padding:28px}
 .topbar{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:24px}
 .brand{font-weight:700;letter-spacing:.2px;display:flex;align-items:center;gap:10px}
@@ -33,27 +33,30 @@
 .item{padding:12px;border-radius:12px;border:1px solid var(--border);background:rgba(0,0,0,.16)}
 [data-theme="light"] .item{background:rgba(17,24,39,.01)}
 
-.appShell{height:100vh;display:flex;flex-direction:column}
+.appShell{min-height:100vh;display:flex;flex-direction:column}
 .appTop{display:flex;align-items:center;justify-content:space-between;gap:14px;padding:16px 18px;border-bottom:1px solid var(--border);background:linear-gradient(180deg,rgba(255,255,255,.04),rgba(255,255,255,0))}
 .appTop .brandLogo{width:140px}
 .topActions{display:flex;align-items:center;gap:10px}
 
-.dashboard{flex:1;min-height:0;display:grid;grid-template-columns:240px 1fr;gap:14px;padding:14px}
+.dashboard{display:grid;grid-template-columns:240px 1fr;grid-template-rows:auto;gap:14px;padding:14px;overflow:visible}
 @media (max-width:920px){.dashboard{grid-template-columns:1fr}.nav{display:none}}
 
 .nav{min-height:0;border:1px solid var(--border);border-radius:16px;background:linear-gradient(180deg,rgba(255,255,255,.06),rgba(255,255,255,.03));box-shadow:var(--shadow);padding:14px;display:flex;flex-direction:column;gap:8px}
 [data-theme="light"] .nav{background:linear-gradient(180deg,rgba(17,24,39,.03),rgba(17,24,39,.01))}
 .navTitle{font-weight:750;margin-bottom:8px}
+.navLinks{display:flex;flex-direction:column;gap:8px}
 .navItem{display:block;padding:10px 12px;border-radius:12px;border:1px solid transparent;color:var(--text);text-decoration:none;background:rgba(0,0,0,.10)}
 [data-theme="light"] .navItem{background:rgba(17,24,39,.02)}
 .navItem:hover{background:rgba(255,255,255,.06);border-color:var(--border)}
 .navItem.active{background:rgba(91,140,255,.14);border-color:rgba(91,140,255,.35)}
 .navSpacer{flex:1}
 
-.view{min-height:0;min-width:0}
+.view{min-width:0}
 .view[style*="display:none"]{height:auto}
-.dashboard > .view{height:100%}
-#viewInbox{height:100%}
+.dashboard > .view{height:auto;overflow:visible}
+#viewInbox{height:auto;overflow:visible}
+#viewSettings{padding-right:4px;padding-bottom:14px}
+#viewBroadcast{padding-right:4px;padding-bottom:14px}
 .pageHeader{margin-bottom:14px}
 .pageTitle{font-weight:800;font-size:18px}
 .pageGrid{display:grid;grid-template-columns:420px 1fr;gap:14px}
@@ -63,7 +66,16 @@
 @media (max-width:1080px){.inboxGrid{grid-template-columns:320px 1fr}.rightPanel{display:none}}
 @media (max-width:860px){.inboxGrid{grid-template-columns:1fr}.sidebar{display:none}.rightPanel{display:none}}
 
-.dashboard{overflow:hidden}
+/* Allow any non-inbox view to scroll when content overflows */
+.dashboard > .view{overflow:visible}
+#viewInbox{overflow:visible}
+
+html[data-view="inbox"] .appShell{height:100vh;min-height:0}
+html[data-view="inbox"] .dashboard{flex:1;min-height:0;grid-template-rows:1fr;overflow:hidden}
+html[data-view="inbox"] .dashboard > .view{height:100%;overflow:hidden}
+html[data-view="inbox"] #viewInbox{height:100%;overflow:hidden}
+
+html:not([data-view="inbox"]) #viewBroadcast{max-height:calc(100vh - 120px);overflow:auto}
 
 .sidebar,.chat,.rightPanel{min-height:0;height:100%;border:1px solid var(--border);border-radius:16px;background:linear-gradient(180deg,rgba(255,255,255,.06),rgba(255,255,255,.03));box-shadow:var(--shadow)}
 [data-theme="light"] .sidebar,[data-theme="light"] .chat,[data-theme="light"] .rightPanel{background:linear-gradient(180deg,rgba(17,24,39,.03),rgba(17,24,39,.01))}
@@ -78,6 +90,12 @@
 .conversationTop{display:flex;align-items:center;justify-content:space-between;gap:10px}
 .conversationName{font-weight:650}
 .badge{font-size:12px;padding:3px 8px;border-radius:999px;border:1px solid var(--border);background:rgba(255,255,255,.05);color:var(--muted)}
+
+.tip{position:relative;display:inline-flex;align-items:center;margin-left:6px}
+.tipIcon{cursor:help;user-select:none}
+.tipContent{display:none;position:absolute;left:0;top:calc(100% + 8px);min-width:240px;max-width:320px;padding:10px 12px;border-radius:12px;border:1px solid var(--border);background:rgba(11,18,32,.96);color:var(--text);box-shadow:var(--shadow);z-index:20001;line-height:1.35}
+[data-theme="light"] .tipContent{background:rgba(255,255,255,.98)}
+.tip:hover .tipContent{display:block}
 
 .chat{display:flex;flex-direction:column;min-width:0}
 .chatHeader{padding:14px 16px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;gap:12px}
@@ -128,3 +146,26 @@
 .toast.error{border-color:rgba(255,91,107,.35)}
 .toast.hide{opacity:0;transform:translateY(6px);transition:opacity .18s ease,transform .18s ease}
 @keyframes toastIn{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:translateY(0)}}
+
+/* Mobile nav drawer (reuse existing sidebar .nav; no duplicate menu) */
+#navHamburger{display:none}
+#navOverlay{display:none}
+
+@media (max-width:920px){
+  #navHamburger{display:inline-flex}
+  .appTop{position:sticky;top:0;z-index:12000;flex-wrap:wrap}
+  .brand{min-width:0}
+  .topActions{width:100%;justify-content:flex-end;flex-wrap:wrap}
+  .dashboard{padding:10px}
+  .callBar{top:74px}
+
+  html.nav-open,html.nav-open body{overflow:hidden}
+  html.nav-open #navOverlay{display:block;position:fixed;inset:0;z-index:15000;background:rgba(0,0,0,.55);backdrop-filter:blur(3px)}
+  html.nav-open .nav{display:flex;position:fixed;top:0;left:0;bottom:0;width:min(320px,calc(100vw - 48px));z-index:15001;border-radius:0;overflow:auto}
+}
+
+@media (max-width:860px){
+  .inboxGrid{grid-template-columns:1fr}
+  .sidebar{display:none}
+  .rightPanel{display:none}
+}

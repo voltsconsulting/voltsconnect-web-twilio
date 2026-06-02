@@ -3,9 +3,361 @@
 declare(strict_types=1);
 
 use App\Auth;
+use App\Licensing\Lic;
 
 function handleAdminRoutes(string $uri, string $method, string $rootDir): bool
 {
+    if ($uri === '/api/admin/licenses/config' && $method === 'GET') {
+        Auth::requireLogin();
+        $pdo = getPdo($rootDir);
+        requirePermission($pdo, 'settings.manage');
+
+        $serverEnc = appSettingGet($pdo, 'lic_server_enc', '');
+        $keyEnc = appSettingGet($pdo, 'lic_key_enc', '');
+
+        json([
+            'has_server' => $serverEnc !== '',
+            'has_key' => $keyEnc !== '',
+        ]);
+        return true;
+    }
+
+    if ($uri === '/api/admin/licenses/config' && $method === 'POST') {
+        Auth::requireLogin();
+        $pdo = getPdo($rootDir);
+        requirePermission($pdo, 'settings.manage');
+
+        $payload = json_decode((string) file_get_contents('php://input'), true);
+        if (!is_array($payload)) {
+            json(['error' => 'Invalid JSON'], 400);
+        }
+
+        $serverHost = trim((string) ($payload['server_host'] ?? ''));
+        $key = trim((string) ($payload['key'] ?? ''));
+        if ($serverHost === '' || $key === '') {
+            json(['error' => 'server_host and key are required'], 422);
+        }
+
+        $serverHost = rtrim($serverHost, '/') . '/';
+        appSettingSet($pdo, 'lic_server_enc', encryptSecret($serverHost));
+        appSettingSet($pdo, 'lic_key_enc', encryptSecret($key));
+        json(['ok' => true]);
+        return true;
+    }
+
+    if ($uri === '/api/admin/users/set-email' && $method === 'POST') {
+        $pdo = getPdo($rootDir);
+        requirePermission($pdo, 'users.manage');
+        $raw = file_get_contents('php://input');
+        $data = json_decode($raw ?: '', true);
+        if (!is_array($data)) {
+            $data = $_POST;
+        }
+        $id = (int)($data['id'] ?? 0);
+        $email = trim((string)($data['email'] ?? ''));
+        $email = strtolower($email);
+        if ($id <= 0 || $email === '') {
+            json(['error' => 'id and email required'], 422);
+        }
+        if (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
+            json(['error' => 'Invalid email'], 422);
+        }
+
+        $row = $pdo->prepare('SELECT id FROM users WHERE id = :id LIMIT 1');
+        $row->execute([':id' => $id]);
+        if (!$row->fetch()) {
+            json(['error' => 'User not found'], 404);
+        }
+
+        try {
+            $stmt = $pdo->prepare('UPDATE users SET email = :e WHERE id = :id');
+            $stmt->execute([':e' => $email, ':id' => $id]);
+        } catch (\Throwable $e) {
+            json(['error' => 'Could not update email (email may already exist)'], 409);
+        }
+        json(['ok' => true]);
+        return true;
+    }
+
+    if ($uri === '/api/admin/licenses' && $method === 'GET') {
+        Auth::requireLogin();
+        $pdo = getPdo($rootDir);
+        requirePermission($pdo, 'settings.manage');
+
+        $rows = [];
+        try {
+            $rows = $pdo->query('SELECT scope, product_id, product_base, admin_email, is_valid, license_title, expire_date, support_end, next_check_at, last_checked_at, last_error, updated_at
+                FROM app_licenses ORDER BY scope ASC')->fetchAll();
+            if (!is_array($rows)) {
+                $rows = [];
+            }
+        } catch (\Throwable $e) {
+            $rows = [];
+        }
+
+        json(['licenses' => $rows]);
+        return true;
+    }
+
+    if ($uri === '/api/admin/licenses/update-info' && $method === 'GET') {
+        Auth::requireLogin();
+        $pdo = getPdo($rootDir);
+        requirePermission($pdo, 'settings.manage');
+
+        $appVersion = trim((string) (appSettingGet($pdo, 'app_version', '1.0.0') ?: '1.0.0'));
+
+        $serverHost = decryptSecret(appSettingGet($pdo, 'lic_server_enc', ''));
+        if (trim($serverHost) === '') {
+            $serverHost = 'https://lic.volts-consulting.com/wp-json/lice/';
+        }
+        $serverHost = rtrim($serverHost, '/') . '/';
+
+        $url = $serverHost . 'product/update/7';
+
+        $body = '';
+        $httpCode = 0;
+        $errMsg = '';
+
+        $ch = curl_init();
+        if ($ch === false) {
+            json(['app_version' => $appVersion, 'update' => null, 'error' => 'Could not init HTTP client']);
+        }
+        curl_setopt_array($ch, [
+            CURLOPT_URL => $url,
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_FOLLOWLOCATION => true,
+            CURLOPT_MAXREDIRS => 10,
+            CURLOPT_TIMEOUT => 20,
+            CURLOPT_SSL_VERIFYPEER => false,
+            CURLOPT_SSL_VERIFYHOST => false,
+            CURLOPT_USERAGENT => 'VoltsConnectWebTwilio/1.0 (+https://volts-consulting.com)',
+        ]);
+        $resp = curl_exec($ch);
+        if (is_string($resp)) {
+            $body = $resp;
+        }
+        $httpCode = (int) (curl_getinfo($ch, CURLINFO_HTTP_CODE) ?: 0);
+        $err = curl_error($ch);
+        curl_close($ch);
+
+        if (trim($body) === '') {
+            $errMsg = 'Empty response from update server (HTTP ' . $httpCode . ')' . ($err ? (': ' . $err) : '');
+            json(['app_version' => $appVersion, 'update' => null, 'error' => $errMsg]);
+        }
+
+        $obj = json_decode($body, true);
+        if (!is_array($obj)) {
+            $snippet = substr(preg_replace('/\s+/', ' ', $body), 0, 220);
+            $errMsg = 'Update info parse error (HTTP ' . $httpCode . '): ' . $snippet;
+            json(['app_version' => $appVersion, 'update' => null, 'error' => $errMsg]);
+        }
+
+        json(['app_version' => $appVersion, 'update' => $obj, 'error' => '']);
+        return true;
+    }
+
+    if ($uri === '/api/admin/licenses/activate' && $method === 'POST') {
+        Auth::requireLogin();
+        $pdo = getPdo($rootDir);
+        requirePermission($pdo, 'settings.manage');
+
+        $payload = json_decode((string) file_get_contents('php://input'), true);
+        if (!is_array($payload)) {
+            json(['error' => 'Invalid JSON'], 400);
+        }
+
+        $scope = trim((string) ($payload['scope'] ?? ''));
+        $productId = trim((string) ($payload['product_id'] ?? ''));
+        $productBase = trim((string) ($payload['product_base'] ?? ''));
+        $licenseKey = trim((string) ($payload['license_key'] ?? ''));
+        $adminEmail = trim((string) ($payload['admin_email'] ?? ''));
+        $appVersion = trim((string) ($payload['app_version'] ?? ''));
+
+        if ($scope === '' || $productId === '' || $productBase === '' || $licenseKey === '') {
+            json(['error' => 'scope, product_id, product_base, license_key are required'], 422);
+        }
+
+        $serverHost = decryptSecret(appSettingGet($pdo, 'lic_server_enc', ''));
+        $key = decryptSecret(appSettingGet($pdo, 'lic_key_enc', ''));
+        if (trim($serverHost) === '' || trim($key) === '') {
+            $serverHost = 'https://lic.volts-consulting.com/wp-json/lice/';
+            $key = 'ECBABCE8CE806F23';
+        }
+        if (trim($serverHost) === '' || trim($key) === '') {
+            json(['error' => 'Licenser server is not configured'], 500);
+        }
+        if ($appVersion === '') {
+            $appVersion = trim((string) (appSettingGet($pdo, 'app_version', '1.0.0') ?: '1.0.0'));
+        }
+
+        $res = Lic::checkLicense($serverHost, $key, $productId, $productBase, $licenseKey, $appVersion, $adminEmail !== '' ? $adminEmail : null);
+        if (empty($res['ok'])) {
+            $err = (string) (($res['error'] ?? '') ?: 'License activation failed');
+            json(['error' => $err], 422);
+        }
+
+        $dur = (int) (($res['request_duration_hours'] ?? 0) ?: 0);
+        $next = null;
+        if ($dur > 0) {
+            $next = (new \DateTimeImmutable('now'))->modify('+' . $dur . ' hours')->format('Y-m-d H:i:s');
+        }
+        $now = (new \DateTimeImmutable('now'))->format('Y-m-d H:i:s');
+
+        $pdo->prepare('INSERT INTO app_licenses (scope, product_id, product_base, admin_email, license_key_enc, is_valid, license_title, expire_date, support_end, next_check_at, last_checked_at, last_error)
+            VALUES (:s, :pid, :pb, :ae, :lk, 1, :lt, :ed, :se, :nca, :lca, \'\')
+            ON DUPLICATE KEY UPDATE
+                product_id = VALUES(product_id),
+                product_base = VALUES(product_base),
+                admin_email = VALUES(admin_email),
+                license_key_enc = VALUES(license_key_enc),
+                is_valid = VALUES(is_valid),
+                license_title = VALUES(license_title),
+                expire_date = VALUES(expire_date),
+                support_end = VALUES(support_end),
+                next_check_at = VALUES(next_check_at),
+                last_checked_at = VALUES(last_checked_at),
+                last_error = VALUES(last_error)')
+            ->execute([
+                ':s' => $scope,
+                ':pid' => $productId,
+                ':pb' => $productBase,
+                ':ae' => $adminEmail !== '' ? $adminEmail : null,
+                ':lk' => encryptSecret($licenseKey),
+                ':lt' => (string) (($res['license_title'] ?? '') ?: ''),
+                ':ed' => (string) (($res['expire_date'] ?? '') ?: ''),
+                ':se' => (string) (($res['support_end'] ?? '') ?: ''),
+                ':nca' => $next,
+                ':lca' => $now,
+            ]);
+
+        json(['ok' => true]);
+        return true;
+    }
+
+    if ($uri === '/api/admin/licenses/deactivate' && $method === 'POST') {
+        Auth::requireLogin();
+        $pdo = getPdo($rootDir);
+        requirePermission($pdo, 'settings.manage');
+
+        $payload = json_decode((string) file_get_contents('php://input'), true);
+        if (!is_array($payload)) {
+            json(['error' => 'Invalid JSON'], 400);
+        }
+
+        $scope = trim((string) ($payload['scope'] ?? ''));
+        $appVersion = trim((string) ($payload['app_version'] ?? ''));
+        if ($scope === '') {
+            json(['error' => 'scope is required'], 422);
+        }
+
+        $row = null;
+        try {
+            $st = $pdo->prepare('SELECT scope, product_id, product_base, admin_email, license_key_enc FROM app_licenses WHERE scope = :s LIMIT 1');
+            $st->execute([':s' => $scope]);
+            $row = $st->fetch();
+        } catch (\Throwable $e) {
+            $row = null;
+        }
+        if (!is_array($row)) {
+            json(['error' => 'License not found'], 404);
+        }
+
+        $licenseKey = decryptSecret((string) (($row['license_key_enc'] ?? '') ?: ''));
+        $productId = trim((string) (($row['product_id'] ?? '') ?: ''));
+        $productBase = trim((string) (($row['product_base'] ?? '') ?: ''));
+        $adminEmail = trim((string) (($row['admin_email'] ?? '') ?: ''));
+
+        if ($licenseKey === '' || $productId === '' || $productBase === '') {
+            json(['error' => 'License data incomplete'], 422);
+        }
+
+        $serverHost = decryptSecret(appSettingGet($pdo, 'lic_server_enc', ''));
+        $key = decryptSecret(appSettingGet($pdo, 'lic_key_enc', ''));
+        if (trim($serverHost) === '' || trim($key) === '') {
+            $serverHost = 'https://lic.volts-consulting.com/wp-json/lice/';
+            $key = 'ECBABCE8CE806F23';
+        }
+        if (trim($serverHost) === '' || trim($key) === '') {
+            json(['error' => 'Licenser server is not configured'], 500);
+        }
+        if ($appVersion === '') {
+            $appVersion = trim((string) (appSettingGet($pdo, 'app_version', '1.0.0') ?: '1.0.0'));
+        }
+
+        $res = Lic::deactivate($serverHost, $key, $productId, $productBase, $licenseKey, $appVersion, $adminEmail !== '' ? $adminEmail : null);
+        if (empty($res['ok'])) {
+            $err = (string) (($res['error'] ?? '') ?: 'Deactivation failed');
+            json(['error' => $err], 422);
+        }
+
+        $pdo->prepare('UPDATE app_licenses SET is_valid = 0, last_error = \'\', next_check_at = NULL, last_checked_at = NOW() WHERE scope = :s')
+            ->execute([':s' => $scope]);
+
+        json(['ok' => true]);
+        return true;
+    }
+
+    if ($uri === '/api/admin/addons' && $method === 'GET') {
+        Auth::requireLogin();
+        $pdo = getPdo($rootDir);
+        requirePermission($pdo, 'settings.manage');
+
+        $reg = addonRegistry();
+        $items = [];
+        foreach ($reg as $a) {
+            $k = trim((string) ($a['key'] ?? ''));
+            $label = (string) ($a['label'] ?? $k);
+            $url = trim((string) ($a['url'] ?? ''));
+            $buyUrl = trim((string) ($a['buy_url'] ?? ''));
+            $comingSoon = !empty($a['coming_soon']);
+            if ($k === '') {
+                continue;
+            }
+            $items[] = [
+                'key' => $k,
+                'label' => $label,
+                'url' => $url,
+                'buy_url' => $buyUrl,
+                'coming_soon' => $comingSoon,
+                'enabled' => addonEnabled($pdo, $k),
+            ];
+        }
+
+        json(['addons' => $items, 'enabled' => enabledAddons($pdo)]);
+        return true;
+    }
+
+    if ($uri === '/api/admin/addons' && $method === 'POST') {
+        Auth::requireLogin();
+        $pdo = getPdo($rootDir);
+        requirePermission($pdo, 'settings.manage');
+
+        $payload = json_decode((string) file_get_contents('php://input'), true);
+        if (!is_array($payload)) {
+            json(['error' => 'Invalid JSON'], 400);
+        }
+
+        $k = trim((string) ($payload['key'] ?? ''));
+        $enabled = !empty($payload['enabled']);
+        if ($k === '') {
+            json(['error' => 'key is required'], 422);
+        }
+        $valid = false;
+        foreach (addonRegistry() as $a) {
+            if (trim((string) ($a['key'] ?? '')) === $k) {
+                $valid = true;
+                break;
+            }
+        }
+        if (!$valid) {
+            json(['error' => 'Unknown addon key'], 422);
+        }
+
+        setAddonEnabled($pdo, $k, $enabled);
+        json(['ok' => true, 'key' => $k, 'enabled' => addonEnabled($pdo, $k), 'enabled_addons' => enabledAddons($pdo)]);
+        return true;
+    }
+
     if ($uri === '/api/admin/settings/timezone' && $method === 'GET') {
         Auth::requireLogin();
         $pdo = getPdo($rootDir);
@@ -193,7 +545,8 @@ function handleAdminRoutes(string $uri, string $method, string $rootDir): bool
             json(['error' => 'phone_number is required'], 422);
         }
 
-        $pdo->prepare('INSERT IGNORE INTO numbers (phone_number, friendly_name) VALUES (:pn, :fn)')
+        $pdo->prepare('INSERT INTO numbers (phone_number, friendly_name) VALUES (:pn, :fn)
+            ON DUPLICATE KEY UPDATE friendly_name = COALESCE(VALUES(friendly_name), friendly_name)')
             ->execute([':pn' => $pn, ':fn' => ($name !== '' ? $name : null)]);
         json(['ok' => true]);
         return true;

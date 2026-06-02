@@ -7,6 +7,35 @@ use Twilio\Rest\Client;
 
 function handleInboxRoutes(string $uri, string $method, string $rootDir): bool
 {
+    $isAdmin = static function (PDO $pdo, int $uid): bool {
+        try {
+            $stmt = $pdo->prepare('SELECT role FROM users WHERE id = :id LIMIT 1');
+            $stmt->execute([':id' => $uid]);
+            $r = $stmt->fetch();
+            return ((string) (($r['role'] ?? '') ?: '')) === 'admin';
+        } catch (\Throwable $e) {
+            return false;
+        }
+    };
+
+    $requireConversationAccess = static function (PDO $pdo, int $uid, int $conversationId) use ($isAdmin): void {
+        if ($conversationId <= 0) {
+            json(['error' => 'conversation_id required'], 422);
+        }
+        if ($isAdmin($pdo, $uid)) {
+            return;
+        }
+        $chk = $pdo->prepare('SELECT 1
+            FROM conversations c
+            INNER JOIN user_numbers un ON un.number_id = c.default_number_id
+            WHERE c.id = :cid AND un.user_id = :uid
+            LIMIT 1');
+        $chk->execute([':cid' => $conversationId, ':uid' => $uid]);
+        if (!$chk->fetch()) {
+            json(['error' => 'Forbidden'], 403);
+        }
+    };
+
     if ($uri === '/api/media/twilio' && $method === 'GET') {
         Auth::requireLogin();
         $pdo = getPdo($rootDir);
@@ -178,7 +207,14 @@ function handleInboxRoutes(string $uri, string $method, string $rootDir): bool
             $perms = [];
         }
 
-        json(['me' => $me, 'roles' => $roles, 'permissions' => $perms]);
+        $addons = [];
+        try {
+            $addons = enabledAddons($pdo);
+        } catch (\Throwable $e) {
+            $addons = [];
+        }
+
+        json(['me' => $me, 'roles' => $roles, 'permissions' => $perms, 'addons' => $addons]);
         return true;
     }
 
@@ -200,6 +236,9 @@ function handleInboxRoutes(string $uri, string $method, string $rootDir): bool
         if ($conversationId <= 0) {
             json(['error' => 'conversation_id required'], 422);
         }
+
+        $requireConversationAccess($pdo, $uid, $conversationId);
+
         if ($messageId < 0) {
             $messageId = 0;
         }
@@ -260,6 +299,11 @@ function handleInboxRoutes(string $uri, string $method, string $rootDir): bool
       WHERE 1=1';
 
         $params = [':uid' => $uid];
+
+        if (!$isAdmin($pdo, $uid)) {
+            $sql .= ' AND EXISTS (SELECT 1 FROM user_numbers un WHERE un.user_id = :uid AND un.number_id = c.default_number_id)';
+        }
+
         if ($q !== '') {
             $sql .= ' AND (ct.phone_number LIKE :q OR ct.name LIKE :q OR ct.first_name LIKE :q OR ct.last_name LIKE :q OR ct.email LIKE :q)';
             $params[':q'] = '%' . $q . '%';
@@ -314,6 +358,13 @@ function handleInboxRoutes(string $uri, string $method, string $rootDir): bool
         if ($conversationId <= 0) {
             json(['error' => 'conversation_id required'], 422);
         }
+
+        $uid = Auth::userId();
+        if ($uid === null) {
+            json(['error' => 'Not authenticated'], 401);
+        }
+        $requireConversationAccess($pdo, $uid, $conversationId);
+
         $limit = (int) ($_GET['limit'] ?? 200);
         if ($limit < 1) {
             $limit = 200;
@@ -485,6 +536,12 @@ function handleInboxRoutes(string $uri, string $method, string $rootDir): bool
             json(['error' => 'conversation_id and body required (or media_urls for MMS)'], 422);
         }
 
+        $uid = Auth::userId();
+        if ($uid === null) {
+            json(['error' => 'Not authenticated'], 401);
+        }
+        $requireConversationAccess($pdo, $uid, $conversationId);
+
         $convStmt = $pdo->prepare('SELECT c.id, c.contact_id, ct.phone_number AS to_number, c.default_number_id, n.phone_number AS default_from
         FROM conversations c
         INNER JOIN contacts ct ON ct.id = c.contact_id
@@ -609,6 +666,16 @@ function handleInboxRoutes(string $uri, string $method, string $rootDir): bool
                 ':st' => (string) ($msg->status ?? 'queued'),
             ]);
         $messageId = (int) $pdo->lastInsertId();
+
+        if ($messageId > 0) {
+            $uid = (int) Auth::userId();
+            $pdo->prepare('INSERT INTO conversation_reads (user_id, conversation_id, last_read_message_id, last_read_at)
+                VALUES (:uid, :cid, :mid, NOW())
+                ON DUPLICATE KEY UPDATE last_read_message_id = GREATEST(last_read_message_id, VALUES(last_read_message_id)), last_read_at = NOW()')
+                ->execute([':uid' => $uid, ':cid' => $sendConversationId, ':mid' => $messageId]);
+            $pdo->prepare('INSERT INTO conversation_read_events (user_id, conversation_id, read_message_id) VALUES (:uid, :cid, :mid)')
+                ->execute([':uid' => $uid, ':cid' => $sendConversationId, ':mid' => $messageId]);
+        }
         if ($messageId > 0 && count($mediaUrls) > 0) {
             $ins = $pdo->prepare('INSERT INTO message_media (message_id, url) VALUES (:mid, :url)');
             foreach ($mediaUrls as $u) {
@@ -663,6 +730,12 @@ function handleInboxRoutes(string $uri, string $method, string $rootDir): bool
         if ($conversationId <= 0) {
             json(['error' => 'conversation_id required'], 422);
         }
+
+        $uid = Auth::userId();
+        if ($uid === null) {
+            json(['error' => 'Not authenticated'], 401);
+        }
+        $requireConversationAccess($pdo, $uid, $conversationId);
         $limit = (int) ($_GET['limit'] ?? 100);
         if ($limit < 1) {
             $limit = 100;
@@ -694,6 +767,13 @@ function handleInboxRoutes(string $uri, string $method, string $rootDir): bool
         if ($conversationId <= 0 || $note === '') {
             json(['error' => 'conversation_id and note required'], 422);
         }
+
+        $uid = Auth::userId();
+        if ($uid === null) {
+            json(['error' => 'Not authenticated'], 401);
+        }
+        $requireConversationAccess($pdo, $uid, $conversationId);
+
         $pdo->prepare('INSERT INTO conversation_notes (conversation_id, user_id, note) VALUES (:cid, :uid, :note)')
             ->execute([':cid' => $conversationId, ':uid' => Auth::userId(), ':note' => $note]);
         json(['ok' => true]);
@@ -703,6 +783,7 @@ function handleInboxRoutes(string $uri, string $method, string $rootDir): bool
     if ($uri === '/api/inbox/assign' && $method === 'POST') {
         Auth::requireLogin();
         $pdo = getPdo($rootDir);
+        requirePermission($pdo, 'inbox.view');
         $raw = file_get_contents('php://input');
         $data = json_decode($raw ?: '', true);
         if (!is_array($data)) {
@@ -713,6 +794,13 @@ function handleInboxRoutes(string $uri, string $method, string $rootDir): bool
         if ($conversationId <= 0) {
             json(['error' => 'conversation_id required'], 422);
         }
+
+        $uid = Auth::userId();
+        if ($uid === null) {
+            json(['error' => 'Not authenticated'], 401);
+        }
+        $requireConversationAccess($pdo, $uid, $conversationId);
+
         if ($assignedUserId === 'me') {
             $assignedUserId = Auth::userId();
         }
@@ -765,6 +853,12 @@ function handleInboxRoutes(string $uri, string $method, string $rootDir): bool
         if ($conversationId <= 0) {
             json(['error' => 'conversation_id required'], 422);
         }
+
+        $uid = Auth::userId();
+        if ($uid === null) {
+            json(['error' => 'Not authenticated'], 401);
+        }
+        $requireConversationAccess($pdo, $uid, $conversationId);
 
         if ($name === '' && ($firstName !== '' || $lastName !== '')) {
             $name = trim($firstName . ' ' . $lastName);

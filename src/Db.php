@@ -68,6 +68,34 @@ final class Db
             KEY idx_schema_migrations_applied_at (applied_at)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci');
 
+        $pdo->exec('CREATE TABLE IF NOT EXISTS app_addons (
+            addon_key VARCHAR(100) NOT NULL,
+            enabled TINYINT(1) NOT NULL DEFAULT 1,
+            updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            PRIMARY KEY (addon_key)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci');
+
+        self::recordMigration($pdo, '1.3_addons_scaffold', 'Update 1.3: Add app_addons table');
+
+        $pdo->exec('CREATE TABLE IF NOT EXISTS app_licenses (
+            scope VARCHAR(100) NOT NULL,
+            product_id VARCHAR(50) NOT NULL,
+            product_base VARCHAR(150) NOT NULL,
+            admin_email VARCHAR(255) NULL,
+            license_key_enc TEXT NULL,
+            is_valid TINYINT(1) NOT NULL DEFAULT 0,
+            license_title VARCHAR(255) NULL,
+            expire_date VARCHAR(50) NULL,
+            support_end VARCHAR(50) NULL,
+            next_check_at DATETIME NULL,
+            last_checked_at DATETIME NULL,
+            last_error VARCHAR(255) NULL,
+            updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            PRIMARY KEY (scope)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci');
+
+        self::recordMigration($pdo, '1.5_licenses_scaffold', 'Update 1.5: Add app_licenses table');
+
         $pdo->exec('CREATE TABLE IF NOT EXISTS teams (
             id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
             name VARCHAR(255) NOT NULL,
@@ -199,32 +227,6 @@ final class Db
         } catch (\Throwable $e) {
         }
 
-        $pdo->exec('CREATE TABLE IF NOT EXISTS conversation_reads (
-            user_id BIGINT UNSIGNED NOT NULL,
-            conversation_id BIGINT UNSIGNED NOT NULL,
-            last_read_message_id BIGINT UNSIGNED NOT NULL DEFAULT 0,
-            last_read_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            PRIMARY KEY (user_id, conversation_id),
-            KEY idx_conversation_reads_conversation_id (conversation_id),
-            CONSTRAINT fk_conversation_reads_user_id FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
-            CONSTRAINT fk_conversation_reads_conversation_id FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci');
-
-        $pdo->exec('CREATE TABLE IF NOT EXISTS conversation_read_events (
-            id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-            user_id BIGINT UNSIGNED NOT NULL,
-            conversation_id BIGINT UNSIGNED NOT NULL,
-            read_message_id BIGINT UNSIGNED NOT NULL DEFAULT 0,
-            created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            PRIMARY KEY (id),
-            KEY idx_cre_conversation_id (conversation_id),
-            KEY idx_cre_created_at (created_at),
-            CONSTRAINT fk_cre_user_id FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
-            CONSTRAINT fk_cre_conversation_id FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci');
-
-        self::recordMigration($pdo, '1.3_read_tracking', 'Update 1.3: Add conversation read tracking');
-
         $pdo->exec('CREATE TABLE IF NOT EXISTS notification_role_rules (
             role_id BIGINT UNSIGNED NOT NULL,
             event_key VARCHAR(120) NOT NULL,
@@ -235,36 +237,6 @@ final class Db
             PRIMARY KEY (role_id, event_key),
             CONSTRAINT fk_nrr_role_id FOREIGN KEY (role_id) REFERENCES roles(id) ON DELETE CASCADE
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci');
-
-        $pdo->exec('CREATE TABLE IF NOT EXISTS notification_sends (
-            id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-            role_id BIGINT UNSIGNED NOT NULL,
-            event_key VARCHAR(120) NOT NULL,
-            ref_key VARCHAR(200) NOT NULL,
-            conversation_id BIGINT UNSIGNED NULL,
-            message_id BIGINT UNSIGNED NULL,
-            created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            PRIMARY KEY (id),
-            UNIQUE KEY uq_notification_sends (role_id, event_key, ref_key),
-            KEY idx_notification_sends_created_at (created_at),
-            CONSTRAINT fk_ns_role_id FOREIGN KEY (role_id) REFERENCES roles(id) ON DELETE CASCADE,
-            CONSTRAINT fk_ns_conversation_id FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci');
-
-        self::recordMigration($pdo, '1.4_notifications', 'Update 1.4: Add notification rules and sends');
-
-        try {
-            $pdo->exec('ALTER TABLE notification_sends ADD COLUMN ref_key VARCHAR(200) NOT NULL DEFAULT \'\'');
-        } catch (\Throwable $e) {
-        }
-        try {
-            $pdo->exec('ALTER TABLE notification_sends DROP INDEX uq_notification_sends');
-        } catch (\Throwable $e) {
-        }
-        try {
-            $pdo->exec('ALTER TABLE notification_sends ADD UNIQUE KEY uq_notification_sends (role_id, event_key, ref_key)');
-        } catch (\Throwable $e) {
-        }
 
         $pdo->exec('CREATE TABLE IF NOT EXISTS twilio_accounts (
             id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
@@ -430,6 +402,98 @@ final class Db
             CONSTRAINT fk_messages_user_id FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci');
 
+        $pdo->exec('CREATE TABLE IF NOT EXISTS broadcast_jobs (
+            id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+            user_id BIGINT UNSIGNED NOT NULL,
+            from_number_id BIGINT UNSIGNED NULL,
+            body TEXT NOT NULL,
+            mode VARCHAR(20) NOT NULL,
+            q VARCHAR(255) NULL,
+            group_id BIGINT UNSIGNED NULL,
+            tag_id BIGINT UNSIGNED NULL,
+            numbers_raw TEXT NULL,
+            batch_size INT UNSIGNED NOT NULL DEFAULT 50,
+            send_delay_ms INT UNSIGNED NOT NULL DEFAULT 0,
+            scheduled_at_utc DATETIME NOT NULL,
+            status VARCHAR(30) NOT NULL DEFAULT \'scheduled\',
+            total_count INT UNSIGNED NOT NULL DEFAULT 0,
+            sent_count INT UNSIGNED NOT NULL DEFAULT 0,
+            opted_out_count INT UNSIGNED NOT NULL DEFAULT 0,
+            failed_count INT UNSIGNED NOT NULL DEFAULT 0,
+            last_error VARCHAR(255) NULL,
+            started_at DATETIME NULL,
+            finished_at DATETIME NULL,
+            created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            PRIMARY KEY (id),
+            KEY idx_broadcast_jobs_scheduled_status (scheduled_at_utc, status),
+            KEY idx_broadcast_jobs_user_id (user_id),
+            CONSTRAINT fk_broadcast_jobs_user_id FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+            CONSTRAINT fk_broadcast_jobs_from_number_id FOREIGN KEY (from_number_id) REFERENCES numbers(id) ON DELETE SET NULL
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci');
+
+        $pdo->exec('CREATE TABLE IF NOT EXISTS broadcast_job_recipients (
+            id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+            job_id BIGINT UNSIGNED NOT NULL,
+            contact_id BIGINT UNSIGNED NULL,
+            phone_number VARCHAR(32) NOT NULL,
+            status VARCHAR(30) NOT NULL DEFAULT \'pending\',
+            error VARCHAR(255) NULL,
+            message_id BIGINT UNSIGNED NULL,
+            twilio_sid VARCHAR(64) NULL,
+            created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            PRIMARY KEY (id),
+            KEY idx_bjr_job_status_id (job_id, status, id),
+            KEY idx_bjr_job_phone (job_id, phone_number),
+            CONSTRAINT fk_bjr_job_id FOREIGN KEY (job_id) REFERENCES broadcast_jobs(id) ON DELETE CASCADE,
+            CONSTRAINT fk_bjr_contact_id FOREIGN KEY (contact_id) REFERENCES contacts(id) ON DELETE SET NULL,
+            CONSTRAINT fk_bjr_message_id FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE SET NULL
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci');
+
+        self::recordMigration($pdo, '2.0_broadcast_scheduling', 'Update 2.0: Add scheduled broadcast jobs');
+
+        try {
+            $pdo->exec('ALTER TABLE broadcast_jobs ADD COLUMN batch_size INT UNSIGNED NOT NULL DEFAULT 50');
+        } catch (\Throwable $e) {
+        }
+        try {
+            $pdo->exec('ALTER TABLE broadcast_jobs ADD COLUMN send_delay_ms INT UNSIGNED NOT NULL DEFAULT 0');
+        } catch (\Throwable $e) {
+        }
+
+        self::recordMigration($pdo, '2.1_broadcast_throttling', 'Update 2.1: Add broadcast throttling controls');
+
+        $pdo->exec('CREATE TABLE IF NOT EXISTS notification_sends (
+            id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+            role_id BIGINT UNSIGNED NOT NULL,
+            event_key VARCHAR(120) NOT NULL,
+            ref_key VARCHAR(200) NOT NULL,
+            conversation_id BIGINT UNSIGNED NULL,
+            message_id BIGINT UNSIGNED NULL,
+            created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (id),
+            UNIQUE KEY uq_notification_sends (role_id, event_key, ref_key),
+            KEY idx_notification_sends_created_at (created_at),
+            CONSTRAINT fk_ns_role_id FOREIGN KEY (role_id) REFERENCES roles(id) ON DELETE CASCADE,
+            CONSTRAINT fk_ns_conversation_id FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci');
+
+        self::recordMigration($pdo, '1.4_notifications', 'Update 1.4: Add notification rules and sends');
+
+        try {
+            $pdo->exec('ALTER TABLE notification_sends ADD COLUMN ref_key VARCHAR(200) NOT NULL DEFAULT \'\'');
+        } catch (\Throwable $e) {
+        }
+        try {
+            $pdo->exec('ALTER TABLE notification_sends DROP INDEX uq_notification_sends');
+        } catch (\Throwable $e) {
+        }
+        try {
+            $pdo->exec('ALTER TABLE notification_sends ADD UNIQUE KEY uq_notification_sends (role_id, event_key, ref_key)');
+        } catch (\Throwable $e) {
+        }
+
         $pdo->exec('CREATE TABLE IF NOT EXISTS message_media (
             id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
             message_id BIGINT UNSIGNED NOT NULL,
@@ -440,6 +504,32 @@ final class Db
             KEY idx_message_media_message_id (message_id),
             CONSTRAINT fk_message_media_message_id FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE CASCADE
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci');
+
+        $pdo->exec('CREATE TABLE IF NOT EXISTS conversation_reads (
+            user_id BIGINT UNSIGNED NOT NULL,
+            conversation_id BIGINT UNSIGNED NOT NULL,
+            last_read_message_id BIGINT UNSIGNED NOT NULL DEFAULT 0,
+            last_read_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (user_id, conversation_id),
+            KEY idx_conversation_reads_conversation_id (conversation_id),
+            CONSTRAINT fk_conversation_reads_user_id FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+            CONSTRAINT fk_conversation_reads_conversation_id FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci');
+
+        $pdo->exec('CREATE TABLE IF NOT EXISTS conversation_read_events (
+            id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+            user_id BIGINT UNSIGNED NOT NULL,
+            conversation_id BIGINT UNSIGNED NOT NULL,
+            read_message_id BIGINT UNSIGNED NOT NULL DEFAULT 0,
+            created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (id),
+            KEY idx_cre_conversation_id (conversation_id),
+            KEY idx_cre_created_at (created_at),
+            CONSTRAINT fk_cre_user_id FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+            CONSTRAINT fk_cre_conversation_id FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci');
+
+        self::recordMigration($pdo, '1.3_read_tracking', 'Update 1.3: Add conversation read tracking');
 
         $pdo->exec('CREATE TABLE IF NOT EXISTS conversation_notes (
             id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,

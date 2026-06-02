@@ -45,6 +45,31 @@ if (isset($_SESSION['_flash']) && is_string($_SESSION['_flash']) && $_SESSION['_
 $uri = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH);
 $method = strtoupper($_SERVER['REQUEST_METHOD'] ?? 'GET');
 
+if (installed($rootDir)) {
+    $isApi = is_string($uri) && str_starts_with((string) $uri, '/api/');
+    $isAppUi = is_string($uri) && ((string) $uri === '/app');
+
+    if ($isApi || $isAppUi) {
+        try {
+            $pdo = getPdo($rootDir);
+            if (!licenseValid($pdo, 'core')) {
+                if ($isApi) {
+                    if (!apiAllowedWhenCoreUnlicensed((string) $uri)) {
+                        json(['error' => 'Core license required'], 402);
+                    }
+                }
+
+                if ($isAppUi) {
+                    http_response_code(402);
+                    render('Payment Required', '<div class="topbar"><div class="brand">WEB- Twilio</div></div><div class="card"><h2 style="margin:0 0 8px 0">License required</h2><div class="small">Your core license is not active. Please contact your admin to reactivate.</div></div>');
+                    exit;
+                }
+            }
+        } catch (\Throwable $e) {
+        }
+    }
+}
+
 if ($uri === '/api/cron/notifications' && $method === 'GET') {
     $pdo = getPdo($rootDir);
     $token = trim((string)($_GET['token'] ?? ''));
@@ -136,6 +161,71 @@ if ($uri === '/api/cron/notifications' && $method === 'GET') {
     }
 
     json(['ok' => true, 'sent' => $sent]);
+}
+
+if ($uri === '/api/cron/run' && $method === 'GET') {
+    $pdo = getPdo($rootDir);
+    $token = trim((string)($_GET['token'] ?? ''));
+    $expected = trim(appSettingGet($pdo, 'notify_cron_token', ''));
+    if ($expected === '' || $token === '' || !hash_equals($expected, $token)) {
+        json(['error' => 'Invalid token'], 403);
+    }
+
+    $fetchJson = static function (string $url): array {
+        $raw = '';
+        if (function_exists('curl_init')) {
+            $ch = curl_init($url);
+            curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+            curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
+            curl_setopt($ch, CURLOPT_TIMEOUT, 25);
+            $out = curl_exec($ch);
+            $err = curl_error($ch);
+            $http = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+            curl_close($ch);
+            if (!is_string($out) || $out === '') {
+                return ['ok' => false, 'http' => $http, 'error' => $err !== '' ? $err : 'empty_response'];
+            }
+            $raw = $out;
+        } else {
+            $ctx = stream_context_create([
+                'http' => [
+                    'method' => 'GET',
+                    'timeout' => 25,
+                    'header' => "Accept: application/json\r\n",
+                ]
+            ]);
+            $out = @file_get_contents($url, false, $ctx);
+            if (!is_string($out) || $out === '') {
+                return ['ok' => false, 'error' => 'empty_response'];
+            }
+            $raw = $out;
+        }
+
+        $parsed = json_decode($raw, true);
+        if (is_array($parsed)) {
+            return $parsed;
+        }
+        return ['ok' => false, 'error' => 'invalid_json'];
+    };
+
+    $base = baseUrl();
+    $t = urlencode($token);
+    $notificationsUrl = $base . '/api/cron/notifications?token=' . $t;
+    $broadcastsUrl = $base . '/api/cron/broadcasts?token=' . $t;
+
+    $results = [
+        'notifications' => $fetchJson($notificationsUrl),
+        'broadcasts' => $fetchJson($broadcastsUrl),
+    ];
+
+    json(['ok' => true, 'results' => $results]);
+}
+
+if ($uri === '/api/cron/broadcasts' && $method === 'GET') {
+    require_once $rootDir . '/src/Http/BroadcastRoutes.php';
+    if (function_exists('handleBroadcastRoutes') && handleBroadcastRoutes((string) $uri, (string) $method, $rootDir)) {
+        exit;
+    }
 }
 
 function installed(string $rootDir): bool
@@ -247,9 +337,125 @@ function getPdo(string $rootDir): PDO
 
     if (!$schemaEnsured) {
         Db::ensureSchema($pdo);
+        try {
+            seedAddons($pdo);
+        } catch (\Throwable $e) {
+        }
         $schemaEnsured = true;
     }
     return $pdo;
+}
+
+function addonRegistry(): array
+{
+    return [
+        ['key' => 'broadcasting', 'label' => 'Broadcasting / Campaigns', 'url' => '', 'buy_url' => '', 'coming_soon' => false, 'default_enabled' => true],
+        ['key' => 'rbac', 'label' => 'Roles & Permissions (RBAC)', 'url' => '', 'buy_url' => '', 'coming_soon' => false, 'default_enabled' => true],
+        ['key' => 'advanced_analytics', 'label' => 'Advanced Analytics', 'url' => '', 'buy_url' => '', 'coming_soon' => true, 'default_enabled' => false],
+        ['key' => 'flow_builder', 'label' => 'Flow Builder / Automations', 'url' => '', 'buy_url' => '', 'coming_soon' => true, 'default_enabled' => false],
+        ['key' => 'integrations', 'label' => 'Integrations / API / Webhooks', 'url' => '', 'buy_url' => '', 'coming_soon' => true, 'default_enabled' => false],
+    ];
+}
+
+function seedAddons(PDO $pdo): void
+{
+    try {
+        $stmt = $pdo->prepare('INSERT IGNORE INTO app_addons (addon_key, enabled) VALUES (:k, :v)');
+        foreach (addonRegistry() as $a) {
+            $k = trim((string) ($a['key'] ?? ''));
+            $v = !empty($a['default_enabled']) ? 1 : 0;
+            if ($k !== '') {
+                $stmt->execute([':k' => $k, ':v' => $v]);
+            }
+        }
+
+        foreach (addonRegistry() as $a) {
+            $k = trim((string) ($a['key'] ?? ''));
+            if ($k === '') {
+                continue;
+            }
+            if (!empty($a['coming_soon'])) {
+                $pdo->prepare('UPDATE app_addons SET enabled = 0 WHERE addon_key = :k')->execute([':k' => $k]);
+            }
+        }
+    } catch (\Throwable $e) {
+    }
+}
+
+function enabledAddons(PDO $pdo): array
+{
+    try {
+        $rows = $pdo->query('SELECT addon_key FROM app_addons WHERE enabled = 1 ORDER BY addon_key ASC')->fetchAll();
+        $out = [];
+        if (is_array($rows)) {
+            foreach ($rows as $r) {
+                $k = trim((string) (($r['addon_key'] ?? '') ?: ''));
+                if ($k !== '') {
+                    $out[] = $k;
+                }
+            }
+        }
+        return $out;
+    } catch (\Throwable $e) {
+        return [];
+    }
+}
+
+function addonEnabled(PDO $pdo, string $addonKey): bool
+{
+    $addonKey = trim($addonKey);
+    if ($addonKey === '') {
+        return true;
+    }
+    try {
+        $stmt = $pdo->prepare('SELECT enabled FROM app_addons WHERE addon_key = :k LIMIT 1');
+        $stmt->execute([':k' => $addonKey]);
+        $row = $stmt->fetch();
+        if (!$row) {
+            return true;
+        }
+        return (int) (($row['enabled'] ?? 1) ?: 0) === 1;
+    } catch (\Throwable $e) {
+        return true;
+    }
+}
+
+function setAddonEnabled(PDO $pdo, string $addonKey, bool $enabled): void
+{
+    $addonKey = trim($addonKey);
+    if ($addonKey === '') {
+        return;
+    }
+    $v = $enabled ? 1 : 0;
+    $pdo->prepare('INSERT INTO app_addons (addon_key, enabled) VALUES (:k, :v)
+        ON DUPLICATE KEY UPDATE enabled = VALUES(enabled)')->execute([':k' => $addonKey, ':v' => $v]);
+}
+
+function requireAddon(PDO $pdo, string $addonKey): void
+{
+    if ($addonKey === '') {
+        return;
+    }
+    if (!addonEnabled($pdo, $addonKey)) {
+        $path = (string) parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH);
+        if (str_starts_with($path, '/api/')) {
+            json(['error' => 'Addon disabled', 'addon' => $addonKey], 403);
+        }
+        http_response_code(403);
+        render('Forbidden', '<div class="topbar"><div class="brand">WEB- Twilio</div></div><div class="card"><h2 style="margin:0 0 8px 0">403</h2><div class="small">Feature disabled.</div></div>');
+        exit;
+    }
+
+    $scope = 'addon:' . $addonKey;
+    if (!licenseValid($pdo, $scope)) {
+        $path = (string) parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH);
+        if (str_starts_with($path, '/api/')) {
+            json(['error' => 'Addon license required', 'addon' => $addonKey, 'scope' => $scope], 402);
+        }
+        http_response_code(402);
+        render('Payment Required', '<div class="topbar"><div class="brand">WEB- Twilio</div></div><div class="card"><h2 style="margin:0 0 8px 0">License required</h2><div class="small">This addon needs an active license.</div></div>');
+        exit;
+    }
 }
 
 function appSettingGet(PDO $pdo, string $key, string $default = ''): string
@@ -259,6 +465,108 @@ function appSettingGet(PDO $pdo, string $key, string $default = ''): string
     $v = $stmt->fetch();
     $raw = (string) (($v['v'] ?? '') ?: '');
     return $raw !== '' ? $raw : $default;
+}
+
+function licenseRow(PDO $pdo, string $scope): ?array
+{
+    $scope = trim($scope);
+    if ($scope === '') {
+        return null;
+    }
+    try {
+        $st = $pdo->prepare('SELECT scope, product_id, product_base, admin_email, license_key_enc, is_valid, license_title, expire_date, support_end, next_check_at, last_checked_at, last_error
+            FROM app_licenses WHERE scope = :s LIMIT 1');
+        $st->execute([':s' => $scope]);
+        $row = $st->fetch();
+        return is_array($row) ? $row : null;
+    } catch (\Throwable $e) {
+        return null;
+    }
+}
+
+function refreshLicenseIfDue(PDO $pdo, string $scope): void
+{
+    $row = licenseRow($pdo, $scope);
+    if (!$row) {
+        return;
+    }
+
+    $next = (string) (($row['next_check_at'] ?? '') ?: '');
+    if ($next !== '') {
+        try {
+            if (strtotime($next) > time()) {
+                return;
+            }
+        } catch (\Throwable $e) {
+        }
+    }
+
+    $serverHost = decryptSecret(appSettingGet($pdo, 'lic_server_enc', ''));
+    $key = decryptSecret(appSettingGet($pdo, 'lic_key_enc', ''));
+    if (trim($serverHost) === '' || trim($key) === '') {
+        return;
+    }
+
+    $productId = trim((string) (($row['product_id'] ?? '') ?: ''));
+    $productBase = trim((string) (($row['product_base'] ?? '') ?: ''));
+    $adminEmail = trim((string) (($row['admin_email'] ?? '') ?: ''));
+    $licenseKey = decryptSecret((string) (($row['license_key_enc'] ?? '') ?: ''));
+    if ($productId === '' || $productBase === '' || $licenseKey === '') {
+        return;
+    }
+
+    $appVersion = appSettingGet($pdo, 'app_version', '1.0.0');
+    $res = \App\Licensing\Lic::checkLicense($serverHost, $key, $productId, $productBase, $licenseKey, $appVersion, $adminEmail !== '' ? $adminEmail : null);
+
+    $now = (new \DateTimeImmutable('now'))->format('Y-m-d H:i:s');
+    $isValid = !empty($res['ok']);
+    $err = $isValid ? '' : (string) (($res['error'] ?? '') ?: 'Invalid license');
+    $dur = $isValid ? (int) (($res['request_duration_hours'] ?? 0) ?: 0) : 0;
+    $nextAt = null;
+    if ($dur > 0) {
+        $nextAt = (new \DateTimeImmutable('now'))->modify('+' . $dur . ' hours')->format('Y-m-d H:i:s');
+    }
+
+    try {
+        $pdo->prepare('UPDATE app_licenses
+            SET is_valid = :v,
+                license_title = :lt,
+                expire_date = :ed,
+                support_end = :se,
+                next_check_at = :nca,
+                last_checked_at = :lca,
+                last_error = :le
+            WHERE scope = :s')
+            ->execute([
+                ':s' => $scope,
+                ':v' => $isValid ? 1 : 0,
+                ':lt' => $isValid ? (string) (($res['license_title'] ?? '') ?: '') : (string) (($row['license_title'] ?? '') ?: ''),
+                ':ed' => $isValid ? (string) (($res['expire_date'] ?? '') ?: '') : (string) (($row['expire_date'] ?? '') ?: ''),
+                ':se' => $isValid ? (string) (($res['support_end'] ?? '') ?: '') : (string) (($row['support_end'] ?? '') ?: ''),
+                ':nca' => $nextAt,
+                ':lca' => $now,
+                ':le' => $err,
+            ]);
+    } catch (\Throwable $e) {
+    }
+}
+
+function licenseValid(PDO $pdo, string $scope): bool
+{
+    refreshLicenseIfDue($pdo, $scope);
+    $row = licenseRow($pdo, $scope);
+    if (!$row) {
+        return false;
+    }
+    return (int) (($row['is_valid'] ?? 0) ?: 0) === 1;
+}
+
+function apiAllowedWhenCoreUnlicensed(string $uri): bool
+{
+    if ($uri === '/api/me') return true;
+    if (str_starts_with($uri, '/api/admin/licenses')) return true;
+    if ($uri === '/api/admin/addons') return true;
+    return false;
 }
 
 function appSettingSet(PDO $pdo, string $key, string $value): void
@@ -460,7 +768,7 @@ if (is_string($uri) && str_starts_with($uri, '/mms/tmp/') && $method === 'GET') 
         exit;
     }
     try {
-        if ((time() - (int) filemtime($path)) > 3600) {
+        if ((time() - (int) filemtime($path)) > 86400) {
             @unlink($path);
             http_response_code(404);
             exit;
@@ -470,7 +778,7 @@ if (is_string($uri) && str_starts_with($uri, '/mms/tmp/') && $method === 'GET') 
 
     foreach (glob($dir . '/*') ?: [] as $p) {
         try {
-            if (is_file($p) && (time() - (int) filemtime($p)) > 3600) {
+            if (is_file($p) && (time() - (int) filemtime($p)) > 86400) {
                 @unlink($p);
             }
         } catch (\Throwable $e) {
@@ -731,7 +1039,7 @@ function requirePermission(PDO $pdo, string $permKey): void
             json(['error' => 'Forbidden'], 403);
         }
         http_response_code(403);
-        render('Forbidden', '<div class="topbar"><div class="brand">VOLTS CONNECT</div></div><div class="card"><h2 style="margin:0 0 8px 0">403</h2><div class="small">Forbidden.</div></div>');
+        render('Forbidden', '<div class="topbar"><div class="brand">WEB- Twilio</div></div><div class="card"><h2 style="margin:0 0 8px 0">403</h2><div class="small">Forbidden.</div></div>');
         exit;
     }
 }
@@ -1624,7 +1932,7 @@ function requireAdmin(PDO $pdo): void
             json(['error' => 'Admin only'], 403);
         }
         http_response_code(403);
-        render('Forbidden', '<div class="topbar"><div class="brand">VOLTS CONNECT</div></div><div class="card"><h2 style="margin:0 0 8px 0">403</h2><div class="small">Admin only.</div></div>');
+        render('Forbidden', '<div class="topbar"><div class="brand">WEB- Twilio</div></div><div class="card"><h2 style="margin:0 0 8px 0">403</h2><div class="small">Admin only.</div></div>');
         exit;
     }
 }
@@ -1635,15 +1943,15 @@ if ($uri === '/login' && $method === 'GET') {
         $msg = '<div class="error">' . h($flash) . '</div>';
     }
 
-    $content = '<div class="topbar"><div class="brand"><img class="brandLogo brandLogoDark" src="/assets/img/logo-dark.svg" alt="Logo"><img class="brandLogo brandLogoLight" src="/assets/img/logo-light.svg" alt="Logo">VOLTS CONNECT</div></div>';
+    $content = '<div class="topbar"><div class="brand"><img class="brandLogo brandLogoDark" src="/assets/img/logo-dark.svg" alt="Logo"><img class="brandLogo brandLogoLight" src="/assets/img/logo-light.svg" alt="Logo">WEB- Twilio</div></div>';
     $content .= '<div class="card"><h2 style="margin:0 0 12px 0">Login</h2>';
     $content .= $msg;
     $content .= '<form method="post" action="/login">';
     $content .= '<div class="row" style="flex-direction:column">';
-    $content .= '<input class="input" name="email" type="email" placeholder="Email" required>'; 
+    $content .= '<input class="input" name="email" type="email" placeholder="Email" required>';
     $content .= '<input class="input" name="password" type="password" placeholder="Password" required>';
     $content .= '</div><div style="height:12px"></div>';
-    $content .= '<button class="btn primary" type="submit">Sign in</button> '; 
+    $content .= '<button class="btn primary" type="submit">Sign in</button> ';
     $content .= '<a class="btn" href="/register">Create account</a>';
     $content .= '</form></div>';
 
@@ -1683,11 +1991,11 @@ if ($uri === '/install' && $method === 'GET') {
     if ($step < 1) {
         $step = 1;
     }
-    if ($step > 3) {
-        $step = 3;
+    if ($step > 4) {
+        $step = 4;
     }
 
-    $content = '<div class="topbar"><div class="brand"><img class="brandLogo brandLogoDark" src="/assets/img/logo-dark.svg" alt="Logo"><img class="brandLogo brandLogoLight" src="/assets/img/logo-light.svg" alt="Logo">VOLTS CONNECT</div></div>';
+    $content = '<div class="topbar"><div class="brand"><img class="brandLogo brandLogoDark" src="/assets/img/logo-dark.svg" alt="Logo"><img class="brandLogo brandLogoLight" src="/assets/img/logo-light.svg" alt="Logo">WEB- Twilio</div></div>';
     $content .= '<div class="card"><h2 style="margin:0 0 12px 0">Install</h2>';
     if (is_string($flash) && $flash !== '') {
         $content .= '<div class="error">' . h($flash) . '</div>';
@@ -1742,14 +2050,33 @@ if ($uri === '/install' && $method === 'GET') {
         exit;
     }
 
-    $content .= '<div class="small">Step 3 of 3: Create admin user</div><div style="height:10px"></div>';
-    $content .= '<form method="post" action="/install?step=3">';
+    if ($step === 3) {
+        $content .= '<div class="small">Step 3 of 4: Create admin user</div><div style="height:10px"></div>';
+        $content .= '<form method="post" action="/install?step=3">';
+        $content .= '<div class="row" style="flex-direction:column">';
+        $content .= '<input class="input" name="email" type="email" placeholder="Admin email" required>';
+        $content .= '<input class="input" name="password" type="password" placeholder="Admin password (min 8 chars)" minlength="8" required>';
+        $content .= '</div><div style="height:12px"></div>';
+        $content .= '<button class="btn primary" type="submit">Continue</button> ';
+        $content .= '<a class="btn" href="/install?step=2">Back</a>';
+        $content .= '</form></div>';
+        render('Install', $content);
+        exit;
+    }
+
+    $prefEmail = '';
+    if (isset($_SESSION['_install_admin_email']) && is_string($_SESSION['_install_admin_email'])) {
+        $prefEmail = trim($_SESSION['_install_admin_email']);
+    }
+
+    $content .= '<div class="small">Step 4 of 4: Activate license</div><div style="height:10px"></div>';
+    $content .= '<form method="post" action="/install?step=4">';
     $content .= '<div class="row" style="flex-direction:column">';
-    $content .= '<input class="input" name="email" type="email" placeholder="Admin email" required>';
-    $content .= '<input class="input" name="password" type="password" placeholder="Admin password (min 8 chars)" minlength="8" required>';
+    $content .= '<input class="input" name="admin_email" type="email" placeholder="Admin email" value="' . h($prefEmail) . '" required>';
+    $content .= '<input class="input" name="license_key" placeholder="License key" required>';
     $content .= '</div><div style="height:12px"></div>';
-    $content .= '<button class="btn primary" type="submit">Finish Install</button> ';
-    $content .= '<a class="btn" href="/install?step=2">Back</a>';
+    $content .= '<button class="btn primary" type="submit">Activate & Finish</button> ';
+    $content .= '<a class="btn" href="/install?step=3">Back</a>';
     $content .= '</form></div>';
     render('Install', $content);
     exit;
@@ -1874,8 +2201,85 @@ if ($uri === '/install' && $method === 'POST') {
             redirect('/install?step=3');
         }
 
+        $_SESSION['_install_admin_email'] = $email;
+        $_SESSION['_flash'] = 'Admin created. Next: activate license.';
+        redirect('/install?step=4');
+    }
+
+    if ($step === 4) {
+        try {
+            Config::load($rootDir);
+            $pdo = getPdo($rootDir);
+        } catch (\Throwable $e) {
+            $_SESSION['_flash'] = 'Database is not configured yet.';
+            redirect('/install?step=2');
+        }
+
+        $adminEmail = trim((string) ($_POST['admin_email'] ?? ''));
+        $licenseKey = trim((string) ($_POST['license_key'] ?? ''));
+
+        if ($adminEmail === '' || $licenseKey === '') {
+            $_SESSION['_flash'] = 'All fields are required.';
+            redirect('/install?step=4');
+        }
+
+        $serverHost = 'https://lic.volts-consulting.com/wp-json/lice/';
+        $key = 'ECBABCE8CE806F23';
+        $productId = '7';
+        $productBase = 'Volts-Connect-Web-Twilio';
+
+        if ($serverHost === '' || $key === '' || $productId === '' || $productBase === '') {
+            $_SESSION['_flash'] = 'Licenser server is not configured.';
+            redirect('/install?step=4');
+        }
+
+        $serverHost = rtrim($serverHost, '/') . '/';
+        appSettingSet($pdo, 'lic_server_enc', encryptSecret($serverHost));
+        appSettingSet($pdo, 'lic_key_enc', encryptSecret($key));
+
+        $appVersion = appSettingGet($pdo, 'app_version', '1.0.0');
+        $res = \App\Licensing\Lic::checkLicense($serverHost, $key, $productId, $productBase, $licenseKey, $appVersion, $adminEmail);
+        if (empty($res['ok'])) {
+            $_SESSION['_flash'] = (string) (($res['error'] ?? '') ?: 'License activation failed');
+            redirect('/install?step=4');
+        }
+
+        $dur = (int) (($res['request_duration_hours'] ?? 0) ?: 0);
+        $next = null;
+        if ($dur > 0) {
+            $next = (new \DateTimeImmutable('now'))->modify('+' . $dur . ' hours')->format('Y-m-d H:i:s');
+        }
+        $now = (new \DateTimeImmutable('now'))->format('Y-m-d H:i:s');
+
+        $pdo->prepare('INSERT INTO app_licenses (scope, product_id, product_base, admin_email, license_key_enc, is_valid, license_title, expire_date, support_end, next_check_at, last_checked_at, last_error)
+            VALUES (\'core\', :pid, :pb, :ae, :lk, 1, :lt, :ed, :se, :nca, :lca, \'\')
+            ON DUPLICATE KEY UPDATE
+                product_id = VALUES(product_id),
+                product_base = VALUES(product_base),
+                admin_email = VALUES(admin_email),
+                license_key_enc = VALUES(license_key_enc),
+                is_valid = VALUES(is_valid),
+                license_title = VALUES(license_title),
+                expire_date = VALUES(expire_date),
+                support_end = VALUES(support_end),
+                next_check_at = VALUES(next_check_at),
+                last_checked_at = VALUES(last_checked_at),
+                last_error = VALUES(last_error)')
+            ->execute([
+                ':pid' => $productId,
+                ':pb' => $productBase,
+                ':ae' => $adminEmail,
+                ':lk' => encryptSecret($licenseKey),
+                ':lt' => (string) (($res['license_title'] ?? '') ?: ''),
+                ':ed' => (string) (($res['expire_date'] ?? '') ?: ''),
+                ':se' => (string) (($res['support_end'] ?? '') ?: ''),
+                ':nca' => $next,
+                ':lca' => $now,
+            ]);
+
         @file_put_contents($rootDir . '/storage/installed.lock', date('c') . "\n");
-        $_SESSION['_flash'] = 'Installed. Please sign in.';
+        unset($_SESSION['_install_admin_email']);
+        $_SESSION['_flash'] = 'Installed and activated. Please sign in.';
         redirect('/login');
     }
 
@@ -1893,7 +2297,7 @@ if ($uri === '/register' && $method === 'GET') {
         $msg = '<div class="error">' . h($flash) . '</div>';
     }
 
-    $content = '<div class="topbar"><div class="brand"><img class="brandLogo brandLogoDark" src="/assets/img/logo-dark.svg" alt="Logo"><img class="brandLogo brandLogoLight" src="/assets/img/logo-light.svg" alt="Logo">VOLTS CONNECT</div></div>';
+    $content = '<div class="topbar"><div class="brand"><img class="brandLogo brandLogoDark" src="/assets/img/logo-dark.svg" alt="Logo"><img class="brandLogo brandLogoLight" src="/assets/img/logo-light.svg" alt="Logo">WEB- Twilio</div></div>';
     $content .= '<div class="card"><h2 style="margin:0 0 12px 0">Create account</h2>';
     $content .= $msg;
     $content .= '<form method="post" action="/register">';
@@ -1945,20 +2349,43 @@ if ($uri === '/logout' && $method === 'POST') {
 if ($uri === '/app' && $method === 'GET') {
     Auth::requireLogin();
 
+    $notifyCronToken = '';
+    try {
+        $pdoUi = getPdo($rootDir);
+        $notifyCronToken = trim(appSettingGet($pdoUi, 'notify_cron_token', ''));
+    } catch (\Throwable $e) {
+    }
+    if ($notifyCronToken === '' || $notifyCronToken === 'YOUR_TOKEN') {
+        try {
+            $notifyCronToken = bin2hex(random_bytes(24));
+        } catch (\Throwable $e) {
+            $notifyCronToken = sha1((string) microtime(true) . ':' . (string) mt_rand());
+        }
+        try {
+            if (isset($pdoUi) && $pdoUi instanceof PDO) {
+                appSettingSet($pdoUi, 'notify_cron_token', $notifyCronToken);
+            }
+        } catch (\Throwable $e) {
+        }
+    }
+
     $content = '<div class="appShell">';
     $content .= '<header class="appTop">';
-    $content .= '<div class="brand"><img class="brandLogo brandLogoDark" src="/assets/img/logo-dark.svg" alt="Logo"><img class="brandLogo brandLogoLight" src="/assets/img/logo-light.svg" alt="Logo">VOLTS CONNECT <span class="small" style="margin-left:6px">WEB - Twilio</span></div>';
+    $content .= '<div class="brand"><img class="brandLogo brandLogoDark" src="/assets/img/logo-dark.svg" alt="Logo"><img class="brandLogo brandLogoLight" src="/assets/img/logo-light.svg" alt="Logo">WEB- Twilio</div>';
     $content .= '<div class="topActions">';
+    $content .= '<button class="btn" type="button" id="navHamburger">Menu</button>';
     $content .= '<button class="btn" type="button" id="themeToggle"><span id="themeToggleIcon" aria-hidden="true"></span><span id="themeToggleLabel">Theme</span></button>';
     $content .= '<form method="post" action="/logout" style="margin:0"><button class="btn danger" type="submit">Logout</button></form>';
     $content .= '</div>';
     $content .= '</header>';
 
+    $content .= '<div id="navOverlay"></div>';
+
     $content .= '<main class="dashboard">';
 
     $content .= '<aside class="nav">';
     $content .= '<div class="navTitle">Menu</div>';
-    $content .= '<nav class="nav">';
+    $content .= '<nav class="navLinks">';
     $content .= '<a class="navItem" href="#analytics" id="navAnalytics">Analytics</a>';
     $content .= '<a class="navItem" href="#inbox" id="navInbox" style="position:relative">Inbox<span id="navInboxDot" style="display:none;position:absolute;top:10px;right:10px;width:8px;height:8px;border-radius:999px;background:#ff5b6b"></span></a>';
     $content .= '<a class="navItem" href="#dialpad" id="navDialpad">Dialpad</a>';
@@ -2256,9 +2683,15 @@ if ($uri === '/app' && $method === 'GET') {
     $content .= '<button class="btn" type="button" data-stab="general">General</button>';
     $content .= '<button class="btn" type="button" data-stab="automations">Automations</button>';
     $content .= '<button class="btn" type="button" data-stab="custom_fields">Custom Fields</button>';
+    $content .= '<button class="btn" type="button" data-stab="addons">Addons</button>';
     $content .= '</div>';
 
     $content .= '<div id="settingsSectionCustomFields" class="settingsSection" data-stab="custom_fields" style="display:none">';
+
+    $content .= '<div class="row" style="margin-top:12px;align-items:center;justify-content:space-between">';
+    $content .= '<div class="small">Custom Fields</div>';
+    $content .= '<button class="btn" type="button" id="refreshSettingsCustomFields">Refresh</button>';
+    $content .= '</div>';
 
     $content .= '<div class="card" style="margin-top:12px">';
     $content .= '<div class="small" style="margin-bottom:10px">Tags</div>';
@@ -2294,30 +2727,53 @@ if ($uri === '/app' && $method === 'GET') {
 
     $content .= '</div>';
 
+    $content .= '<div id="settingsSectionAddons" class="settingsSection" data-stab="addons" style="display:none">';
+    $content .= '<div class="row" style="margin-top:12px;align-items:center;justify-content:space-between">';
+    $content .= '<div class="small">Addons</div>';
+    $content .= '<button class="btn" type="button" id="refreshSettingsAddons">Refresh</button>';
+    $content .= '</div>';
+    $content .= '<div class="card" style="margin-top:12px">';
+    $content .= '<div class="row" style="align-items:center;justify-content:space-between">';
+    $content .= '<div class="small">Addons</div>';
+    $content .= '</div>';
+    $content .= '<div style="height:12px"></div>';
+    $content .= '<div class="list" id="addonsList"></div>';
+    $content .= '<div class="small" style="margin-top:10px">You will be able to purchase addons and activate them with a license key here later.</div>';
+    $content .= '</div>';
+
+    $content .= '</div>';
+
     $content .= '<div id="settingsSectionTwilio" class="settingsSection" data-stab="twilio">';
+
+    $content .= '<div class="row" style="margin-top:12px;align-items:center;justify-content:space-between">';
+    $content .= '<div class="small">Twilio</div>';
+    $content .= '<button class="btn" type="button" id="refreshSettingsTwilio">Refresh</button>';
+    $content .= '</div>';
 
     $content .= '<div class="card">';
     $content .= '<div class="row" style="align-items:center;justify-content:space-between">';
     $content .= '<div class="small">Twilio Accounts (credential profiles)</div>';
-    $content .= '<button class="btn" type="button" id="refreshTwilioAccounts">Refresh</button>';
     $content .= '</div>';
     $content .= '<div style="height:12px"></div>';
     $content .= '<div class="pageGrid">';
     $content .= '<div class="card">';
+    $content .= '<div class="row" style="align-items:center;justify-content:space-between">';
     $content .= '<div class="small" style="margin-bottom:10px">Add / update profile</div>';
+    $content .= '<button class="btn" type="button" id="twilioOptionalInfo">i</button>';
+    $content .= '</div>';
     $content .= '<input class="input" id="taName" placeholder="Profile name (unique)">';
     $content .= '<div style="height:10px"></div>';
     $content .= '<input class="input" id="taAccountSid" placeholder="Account SID">';
     $content .= '<div style="height:10px"></div>';
     $content .= '<input class="input" id="taAuthToken" placeholder="Auth Token">';
     $content .= '<div style="height:10px"></div>';
-    $content .= '<input class="input" id="taApiKey" placeholder="API Key (optional)">';
+    $content .= '<input class="input" id="taApiKey" placeholder="API SID">';
     $content .= '<div style="height:10px"></div>';
-    $content .= '<input class="input" id="taApiSecret" placeholder="API Secret (optional)">';
+    $content .= '<input class="input" id="taApiSecret" placeholder="API Secret">';
     $content .= '<div style="height:10px"></div>';
-    $content .= '<input class="input" id="taTwimlAppSid" placeholder="TwiML App SID (optional)">';
+    $content .= '<input class="input" id="taTwimlAppSid" placeholder="TwiML App SID">';
     $content .= '<div style="height:10px"></div>';
-    $content .= '<input class="input" id="taDefaultFrom" placeholder="Default From Number (optional)">';
+    $content .= '<input class="input" id="taDefaultFrom" placeholder="Default From Number">';
     $content .= '<div style="height:12px"></div>';
     $content .= '<button class="btn primary" type="button" id="addTwilioAccountBtn">Save profile</button>';
     $content .= '</div>';
@@ -2328,11 +2784,10 @@ if ($uri === '/app' && $method === 'GET') {
     $content .= '</div>';
     $content .= '</div>';
 
-    $content .= '<div class="card" style="margin-top:12px">';
+    $content .= '<div class="card" id="defaultTwilioCard" style="margin-top:12px">';
     $content .= '<div class="row" style="align-items:center;justify-content:space-between">';
     $content .= '<div class="small">Default Twilio profile</div>';
     $content .= '<div class="row">';
-    $content .= '<button class="btn" type="button" id="refreshDefaultTwilio">Refresh</button>';
     $content .= '<button class="btn primary" type="button" id="saveDefaultTwilio">Save</button>';
     $content .= '</div>';
     $content .= '</div>';
@@ -2341,15 +2796,38 @@ if ($uri === '/app' && $method === 'GET') {
     $content .= '<div class="small" style="margin-top:10px">Used when a number does not have an account profile selected.</div>';
     $content .= '</div>';
 
+    $content .= '<div class="card" style="margin-top:12px">';
+    $content .= '<div class="row" style="align-items:center;justify-content:space-between">';
+    $content .= '<div class="small">Webhooks</div>';
+    $content .= '<button class="btn" type="button" id="showWebhooksInfo">i</button>';
+    $content .= '</div>';
+    $content .= '<div style="height:12px"></div>';
+    $content .= '<div class="small" style="margin-bottom:6px">SMS webhook (incoming)</div>';
+    $content .= '<input class="input" id="twilioSmsWebhookUrl" name="twilioSmsWebhookUrl" readonly value="' . h(baseUrl() . '/webhooks/twilio/sms') . '" onclick="this.select()">';
+    $content .= '<div style="height:10px"></div>';
+    $content .= '<div class="small" style="margin-bottom:6px">SMS status callback (delivery receipts)</div>';
+    $content .= '<input class="input" id="twilioSmsStatusCallbackUrl" name="twilioSmsStatusCallbackUrl" readonly value="' . h(baseUrl() . '/webhooks/twilio/sms/status') . '" onclick="this.select()">';
+    $content .= '<div style="height:10px"></div>';
+    $content .= '<div class="small" style="margin-bottom:6px">Voice webhook (TwiML App Voice URL)</div>';
+    $content .= '<input class="input" id="twilioVoiceWebhookUrl" name="twilioVoiceWebhookUrl" readonly value="' . h(baseUrl() . '/webhooks/twilio/voice') . '" onclick="this.select()">';
+    $content .= '<div style="height:10px"></div>';
+    $content .= '<div class="small" style="margin-bottom:6px">Voice status callback</div>';
+    $content .= '<input class="input" id="twilioVoiceStatusCallbackUrl" name="twilioVoiceStatusCallbackUrl" readonly value="' . h(baseUrl() . '/webhooks/twilio/voice/status') . '" onclick="this.select()">';
+    $content .= '</div>';
+
     $content .= '</div>';
 
     $content .= '<div id="settingsSectionEmail" class="settingsSection" data-stab="email" style="display:none">';
+
+    $content .= '<div class="row" style="margin-top:12px;align-items:center;justify-content:space-between">';
+    $content .= '<div class="small">Email</div>';
+    $content .= '<button class="btn" type="button" id="refreshSettingsEmail">Refresh</button>';
+    $content .= '</div>';
 
     $content .= '<div class="card" style="margin-top:12px">';
     $content .= '<div class="row" style="align-items:center;justify-content:space-between">';
     $content .= '<div class="small">SMTP email</div>';
     $content .= '<div class="row">';
-    $content .= '<button class="btn" type="button" id="refreshSmtp">Refresh</button>';
     $content .= '<button class="btn primary" type="button" id="saveSmtp">Save</button>';
     $content .= '</div>';
     $content .= '</div>';
@@ -2374,7 +2852,6 @@ if ($uri === '/app' && $method === 'GET') {
     $content .= '<div style="height:10px"></div>';
     $content .= '<input class="input" id="smtpFromName" placeholder="From name (optional)">';
     $content .= '</div>';
-    $content .= '</div>';
     $content .= '<div class="row" style="margin-top:10px;align-items:flex-end">';
     $content .= '<input class="input" id="smtpTestTo" placeholder="Test email to (e.g. you@company.com)" style="flex:1">';
     $content .= '<button class="btn" type="button" id="sendSmtpTest">Send test</button>';
@@ -2382,31 +2859,29 @@ if ($uri === '/app' && $method === 'GET') {
     $content .= '<div class="small" style="margin-top:10px">Notifications sent: Voicemail alerts (sent to all admin users). Password is stored encrypted in the database.</div>';
     $content .= '</div>';
     $content .= '</div>';
+    $content .= '</div>';
     $content .= '<div id="settingsSectionGeneral" class="settingsSection" data-stab="general" style="display:none">';
+
+    $content .= '<div class="row" style="margin-top:12px;align-items:center;justify-content:space-between">';
+    $content .= '<div class="small">General</div>';
+    $content .= '<button class="btn" type="button" id="refreshSettingsGeneral">Refresh</button>';
+    $content .= '</div>';
     $content .= '<div class="card" style="margin-top:12px">';
     $content .= '<div class="row" style="align-items:center;justify-content:space-between">';
-    $content .= '<div class="small">Webhooks</div>';
-    $content .= '<button class="btn" type="button" id="showWebhooksInfo">i</button>';
+    $content .= '<div class="small">Licenses</div>';
     $content .= '</div>';
     $content .= '<div style="height:12px"></div>';
-    $content .= '<div class="small" style="margin-bottom:6px">SMS webhook (incoming)</div>';
-    $content .= '<input class="input" id="twilioSmsWebhookUrl" name="twilioSmsWebhookUrl" readonly value="' . h(baseUrl() . '/webhooks/twilio/sms') . '" onclick="this.select()">';
-    $content .= '<div style="height:10px"></div>';
-    $content .= '<div class="small" style="margin-bottom:6px">SMS status callback (delivery receipts)</div>';
-    $content .= '<input class="input" id="twilioSmsStatusCallbackUrl" name="twilioSmsStatusCallbackUrl" readonly value="' . h(baseUrl() . '/webhooks/twilio/sms/status') . '" onclick="this.select()">';
-    $content .= '<div style="height:10px"></div>';
-    $content .= '<div class="small" style="margin-bottom:6px">Voice webhook (TwiML App Voice URL)</div>';
-    $content .= '<input class="input" id="twilioVoiceWebhookUrl" name="twilioVoiceWebhookUrl" readonly value="' . h(baseUrl() . '/webhooks/twilio/voice') . '" onclick="this.select()">';
-    $content .= '<div style="height:10px"></div>';
-    $content .= '<div class="small" style="margin-bottom:6px">Voice status callback</div>';
-    $content .= '<input class="input" id="twilioVoiceStatusCallbackUrl" name="twilioVoiceStatusCallbackUrl" readonly value="' . h(baseUrl() . '/webhooks/twilio/voice/status') . '" onclick="this.select()">';
+    $content .= '<div class="small" id="updateInfoSummary"></div>';
+    $content .= '<div style="height:12px"></div>';
+    $content .= '<div class="small" id="coreLicenseSummary"></div>';
+    $content .= '<div style="height:12px"></div>';
+    $content .= '<div class="list" id="licensesList"></div>';
     $content .= '</div>';
 
     $content .= '<div class="card" style="margin-top:12px">';
     $content .= '<div class="row" style="align-items:center;justify-content:space-between">';
     $content .= '<div class="small">Timezone</div>';
     $content .= '<div class="row">';
-    $content .= '<button class="btn" type="button" id="refreshTimezone">Refresh</button>';
     $content .= '<button class="btn primary" type="button" id="saveTimezone">Save</button>';
     $content .= '</div>';
     $content .= '</div>';
@@ -2414,6 +2889,27 @@ if ($uri === '/app' && $method === 'GET') {
     $content .= '<select class="input" id="appTimezone"></select>';
     $content .= '<div class="small" style="margin-top:10px">Used for scheduling campaigns and displaying times.</div>';
     $content .= '<div class="small" style="margin-top:6px">Current time: <span id="timezoneNow"></span></div>';
+    $content .= '</div>';
+
+    $content .= '<div class="card" style="margin-top:12px">';
+    $cronUrl = baseUrl() . '/api/cron/run?token=' . urlencode($notifyCronToken);
+    $cronCurl = 'curl -fsS "' . $cronUrl . '" > /dev/null 2>&1';
+    $cronWget = 'wget -q -O- "' . $cronUrl . '" > /dev/null 2>&1';
+    $cronCrontab = '*/1 * * * * ' . $cronCurl;
+    $content .= '<div class="small" style="margin-bottom:10px">Cron jobs</div>';
+    $content .= '<div class="small" style="margin-bottom:6px">Cron URL (notifications + broadcasts)</div>';
+    $content .= '<input class="input" readonly value="' . h($cronUrl) . '" onclick="this.select()">';
+    $content .= '<div class="small" style="margin-top:6px">(Same token is used for both cron endpoints.)</div>';
+    $content .= '<div style="height:10px"></div>';
+    $content .= '<div class="small" style="margin-bottom:6px">Command (cURL)</div>';
+    $content .= '<input class="input" readonly value="' . h($cronCurl) . '" onclick="this.select()">';
+    $content .= '<div style="height:10px"></div>';
+    $content .= '<div class="small" style="margin-bottom:6px">Command (wget)</div>';
+    $content .= '<input class="input" readonly value="' . h($cronWget) . '" onclick="this.select()">';
+    $content .= '<div style="height:10px"></div>';
+    $content .= '<div class="small" style="margin-bottom:6px">Crontab (recommended: every 1 minute)</div>';
+    $content .= '<input class="input" readonly value="' . h($cronCrontab) . '" onclick="this.select()">';
+    $content .= '<div class="small" style="margin-top:10px">Recommended interval: every 1 minute.</div>';
     $content .= '</div>';
 
     $content .= '<div class="card" style="margin-top:12px">';
@@ -2425,11 +2921,14 @@ if ($uri === '/app' && $method === 'GET') {
     $content .= '</div>';
 
     $content .= '<div id="settingsSectionAutomations" class="settingsSection" data-stab="automations" style="display:none">';
+    $content .= '<div class="row" style="margin-top:12px;align-items:center;justify-content:space-between">';
+    $content .= '<div class="small">Automations</div>';
+    $content .= '<button class="btn" type="button" id="refreshSettingsAutomations">Refresh</button>';
+    $content .= '</div>';
     $content .= '<div class="card" style="margin-top:12px">';
     $content .= '<div class="row" style="align-items:center;justify-content:space-between">';
     $content .= '<div class="small">SMS opt-out (STOP)</div>';
     $content .= '<div class="row">';
-    $content .= '<button class="btn" type="button" id="refreshOptOut">Refresh</button>';
     $content .= '<button class="btn primary" type="button" id="saveOptOut">Save</button>';
     $content .= '</div>';
     $content .= '</div>';
@@ -2441,7 +2940,6 @@ if ($uri === '/app' && $method === 'GET') {
     $content .= '<div class="card" style="margin-top:12px">';
     $content .= '<div class="row" style="align-items:center;justify-content:space-between">';
     $content .= '<div class="small">Notification rules</div>';
-    $content .= '<button class="btn" type="button" id="refreshNotifRules">Refresh</button>';
     $content .= '</div>';
     $content .= '<div style="height:12px"></div>';
     $content .= '<div class="small">Role</div>';
@@ -2451,7 +2949,7 @@ if ($uri === '/app' && $method === 'GET') {
     $content .= '<div class="list" id="notifEventsList"></div>';
     $content .= '<div style="height:12px"></div>';
     $content .= '<button class="btn primary" type="button" id="notifSaveRule">Save</button>';
-    $content .= '<div class="small" style="margin-top:10px">Reminder cron: call /api/cron/notifications?token=YOUR_TOKEN (token stored in app_settings: notify_cron_token)</div>';
+    $content .= '<div class="small" style="margin-top:10px">Reminder cron: call ' . h($cronUrl) . ' (token stored in app_settings: notify_cron_token)</div>';
     $content .= '</div>';
 
     $content .= '<div class="card" style="margin-top:12px">';
@@ -2464,11 +2962,15 @@ if ($uri === '/app' && $method === 'GET') {
 
     $content .= '<div id="settingsSectionVoice" class="settingsSection" data-stab="voice" style="display:none">';
 
+    $content .= '<div class="row" style="margin-top:12px;align-items:center;justify-content:space-between">';
+    $content .= '<div class="small">Voice</div>';
+    $content .= '<button class="btn" type="button" id="refreshSettingsVoice">Refresh</button>';
+    $content .= '</div>';
+
     $content .= '<div class="card" style="margin-top:12px">';
     $content .= '<div class="row" style="align-items:center;justify-content:space-between">';
     $content .= '<div class="small">Voice routing (inbound fallback)</div>';
     $content .= '<div class="row">';
-    $content .= '<button class="btn" type="button" id="refreshVoiceRouting">Refresh</button>';
     $content .= '<button class="btn primary" type="button" id="saveVoiceRouting">Save</button>';
     $content .= '</div>';
     $content .= '</div>';
@@ -2562,11 +3064,13 @@ if ($uri === '/app' && $method === 'GET') {
     $content .= '<div class="pageHeader"><div class="pageTitle">Broadcast</div><div class="small">Bulk messaging (preview first)</div></div>';
 
     $content .= '<div class="row" id="broadcastTabs" style="margin-top:12px;gap:8px;flex-wrap:wrap">';
-    $content .= '<button class="btn" type="button" data-btab="campaigns">Campaigns</button>';
+    $content .= '<button class="btn" type="button" data-btab="send">Send</button>';
+    $content .= '<button class="btn" type="button" data-btab="history">Campaigns</button>';
+    $content .= '<button class="btn" type="button" data-btab="analytics">Analytics</button>';
     $content .= '<button class="btn" type="button" data-btab="templates">Templates</button>';
     $content .= '</div>';
 
-    $content .= '<div id="broadcastSectionCampaigns" class="broadcastSection" data-btab="campaigns">';
+    $content .= '<div id="broadcastSectionCampaigns" class="broadcastSection" data-btab="send">';
     $content .= '<div class="card" style="margin-top:12px">';
     $content .= '<div class="small" style="margin-bottom:10px">Audience</div>';
     $content .= '<select class="input" id="broadcastAudienceMode">'
@@ -2609,6 +3113,48 @@ if ($uri === '/app' && $method === 'GET') {
     $content .= '<div style="height:10px"></div>';
     $content .= '<select class="input" id="broadcastFromNumber"></select>';
     $content .= '<div style="height:10px"></div>';
+
+    $content .= '<div class="row" style="align-items:center;gap:10px;margin-bottom:6px">';
+    $content .= '<div class="small">Throttling</div>';
+    $content .= '<label class="small" style="display:flex;align-items:center;gap:8px">'
+        . '<input type="checkbox" id="broadcastThrottleEnabled">'
+        . '<span>Enable</span>'
+        . '</label>';
+    $content .= '</div>';
+    $content .= '<div id="broadcastThrottleBox" style="display:none">';
+    $content .= '<div class="row" style="flex-wrap:wrap">';
+    $content .= '<div style="min-width:220px;flex:1">';
+    $content .= '<div class="small" style="margin-bottom:6px">Batch size <span class="tip"><span class="badge tipIcon">?</span><span class="tipContent">Batch size controls how many recipients are sent per run.<br><br><strong>Scheduled</strong>: per cron tick<br><strong>Send now</strong>: per immediate run<br><br>Smaller batches reduce timeouts and traffic spikes.</span></span></div>';
+    $content .= '<input class="input" id="broadcastBatchSize" type="number" min="1" max="500" step="1" value="50">';
+    $content .= '</div>';
+    $content .= '<div style="min-width:220px;flex:1">';
+    $content .= '<div class="small" style="margin-bottom:6px">Delay per message (ms) <span class="tip"><span class="badge tipIcon">?</span><span class="tipContent">Adds a pause after each message send.<br><br>Helps smooth traffic, reduce filtering spikes, and avoid server overload on shared hosting.</span></span></div>';
+    $content .= '<input class="input" id="broadcastSendDelayMs" type="number" min="0" max="5000" step="10" value="0">';
+    $content .= '<div class="small" style="margin-top:8px">Example: Batch 25 + Delay 200ms.</div>';
+    $content .= '</div>';
+    $content .= '</div>';
+    $content .= '</div>';
+    $content .= '<div style="height:10px"></div>';
+
+    $content .= '<div class="small" style="margin-bottom:6px">Send</div>';
+    $content .= '<select class="input" id="broadcastSendMode">'
+        . '<option value="now">Send now</option>'
+        . '<option value="schedule">Schedule</option>'
+        . '</select>';
+    $content .= '<div id="broadcastScheduleBox" style="display:none;margin-top:10px">';
+    $content .= '<div class="pageGrid">';
+    $content .= '<div class="card">';
+    $content .= '<div class="small" style="margin-bottom:6px">Date</div>';
+    $content .= '<input class="input" id="broadcastScheduleDate" type="date">';
+    $content .= '</div>';
+    $content .= '<div class="card">';
+    $content .= '<div class="small" style="margin-bottom:6px">Time</div>';
+    $content .= '<input class="input" id="broadcastScheduleTime" type="time">';
+    $content .= '<div class="small" style="margin-top:8px">Times use your app timezone (Settings → General).</div>';
+    $content .= '</div>';
+    $content .= '</div>';
+    $content .= '</div>';
+
     $content .= '<textarea class="input" id="broadcastBody" placeholder="Write your message" rows="4" style="resize:none"></textarea>';
     $content .= '<div class="small" id="broadcastSmsCounter" style="margin-top:6px"></div>';
     $content .= '<div style="height:10px"></div>';
@@ -2624,6 +3170,39 @@ if ($uri === '/app' && $method === 'GET') {
     $content .= '<div id="broadcastPreview" style="margin-top:10px"></div>';
     $content .= '</div>';
 
+    $content .= '</div>';
+
+    $content .= '<div id="broadcastSectionHistory" class="broadcastSection" data-btab="history" style="display:none">';
+    $content .= '<div class="card" style="margin-top:12px">';
+    $content .= '<div class="row" style="align-items:center;justify-content:space-between">';
+    $content .= '<div class="small">Campaigns</div>';
+    $content .= '<div class="row">';
+    $content .= '<button class="btn" type="button" id="broadcastJobsRefresh">Refresh</button>';
+    $content .= '</div>';
+    $content .= '</div>';
+    $content .= '<div style="height:12px"></div>';
+    $content .= '<div class="list" id="broadcastJobsList"></div>';
+    $content .= '</div>';
+    $content .= '</div>';
+
+    $content .= '<div id="broadcastSectionAnalytics" class="broadcastSection" data-btab="analytics" style="display:none">';
+    $content .= '<div class="card" style="margin-top:12px">';
+    $content .= '<div class="row" style="align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap">';
+    $content .= '<div class="small">Analytics</div>';
+    $content .= '<div class="row" style="gap:8px;flex-wrap:wrap">';
+    $content .= '<select class="input" id="broadcastJobSelect" style="min-width:240px"></select>';
+    $content .= '<button class="btn" type="button" id="broadcastJobRefresh">Refresh</button>';
+    $content .= '</div>';
+    $content .= '</div>';
+    $content .= '<div style="height:12px"></div>';
+    $content .= '<div id="broadcastJobSummary"></div>';
+    $content .= '<div style="height:12px"></div>';
+    $content .= '<div id="broadcastJobCounts"></div>';
+    $content .= '<div style="height:12px"></div>';
+    $content .= '<div id="broadcastJobErrors"></div>';
+    $content .= '<div style="height:12px"></div>';
+    $content .= '<div id="broadcastJobSample"></div>';
+    $content .= '</div>';
     $content .= '</div>';
 
     $content .= '<div id="broadcastSectionTemplates" class="broadcastSection" data-btab="templates" style="display:none">';
@@ -2774,7 +3353,13 @@ if ($uri === '/app' && $method === 'GET') {
     $content .= '</div>';
     $content .= '</div>';
 
-    $content .= '<script src="/app.js"></script>';
+    $appJsVer = '';
+    try {
+        $appJsVer = (string) (@filemtime(__DIR__ . '/app.js') ?: '');
+    } catch (\Throwable $e) {
+        $appJsVer = '';
+    }
+    $content .= '<script src="/app.js?v=' . h($appJsVer) . '"></script>';
 
     render('Dashboard', $content);
     exit;
@@ -2829,14 +3414,52 @@ if ($uri === '/api/voice/token' && $method === 'GET') {
         json(['error' => 'Not authenticated'], 401);
     }
 
-    $cfg = twilioConfig($pdo, $uid);
-    $accountSid = (string) ($cfg['account_sid'] ?? '');
-    $apiKey = (string) ($cfg['api_key'] ?? '');
-    $apiSecret = (string) ($cfg['api_secret'] ?? '');
-    $appSid = (string) ($cfg['twiml_app_sid'] ?? '');
+    $fromNumberId = (int) ($_GET['from_number_id'] ?? $_GET['FromNumberId'] ?? 0);
+    $fromTwilioAccountId = 0;
+    if ($fromNumberId > 0) {
+        try {
+            $stmt = $pdo->prepare('SELECT n.twilio_account_id
+                FROM numbers n
+                INNER JOIN user_numbers un ON un.number_id = n.id
+                WHERE un.user_id = :uid AND n.id = :nid
+                LIMIT 1');
+            $stmt->execute([':uid' => $uid, ':nid' => $fromNumberId]);
+            $row = $stmt->fetch();
+            $fromTwilioAccountId = (int) (($row['twilio_account_id'] ?? 0) ?: 0);
+        } catch (\Throwable $e) {
+            $fromTwilioAccountId = 0;
+        }
+    }
+
+    $accountSid = '';
+    $apiKey = '';
+    $apiSecret = '';
+    $appSid = '';
+    if ($fromTwilioAccountId > 0) {
+        try {
+            $stmt = $pdo->prepare('SELECT account_sid, api_key, api_secret, twiml_app_sid FROM twilio_accounts WHERE id = :id LIMIT 1');
+            $stmt->execute([':id' => $fromTwilioAccountId]);
+            $acc = $stmt->fetch();
+            if (is_array($acc)) {
+                $accountSid = (string) (($acc['account_sid'] ?? '') ?: '');
+                $apiKey = (string) (($acc['api_key'] ?? '') ?: '');
+                $apiSecret = (string) (($acc['api_secret'] ?? '') ?: '');
+                $appSid = (string) (($acc['twiml_app_sid'] ?? '') ?: '');
+            }
+        } catch (\Throwable $e) {
+        }
+    }
 
     if ($accountSid === '' || $apiKey === '' || $apiSecret === '' || $appSid === '') {
-        json(['error' => 'Missing Twilio Voice credentials. Configure a Twilio profile (API Key/Secret + TwiML App SID) and set a default profile in Settings.'], 500);
+        $cfg = twilioConfig($pdo, $uid);
+        $accountSid = (string) ($cfg['account_sid'] ?? '');
+        $apiKey = (string) ($cfg['api_key'] ?? '');
+        $apiSecret = (string) ($cfg['api_secret'] ?? '');
+        $appSid = (string) ($cfg['twiml_app_sid'] ?? '');
+    }
+
+    if ($accountSid === '' || $apiKey === '' || $apiSecret === '' || $appSid === '') {
+        json(['error' => 'Missing Twilio Voice credentials. For browser calling, set API SID/Secret + TwiML App SID on the Twilio profile assigned to your selected From number (or set a default Twilio profile in Settings).'], 500);
     }
 
     $uStmt = $pdo->prepare('SELECT email FROM users WHERE id = :id LIMIT 1');
@@ -2856,4 +3479,4 @@ if ($uri === '/api/voice/token' && $method === 'GET') {
 }
 
 http_response_code(404);
-render('Not Found', '<div class="topbar"><div class="brand">VOLTS CONNECT</div></div><div class="card"><h2 style="margin:0 0 8px 0">404</h2><div class="small">Page not found.</div></div>');
+render('Not Found', '<div class="topbar"><div class="brand">WEB- Twilio</div></div><div class="card"><h2 style="margin:0 0 8px 0">404</h2><div class="small">Page not found.</div></div>');

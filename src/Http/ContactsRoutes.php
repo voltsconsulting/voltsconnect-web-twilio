@@ -6,19 +6,64 @@ use App\Auth;
 
 function handleContactsRoutes(string $uri, string $method, string $rootDir): bool
 {
+    $isAdmin = static function (PDO $pdo, int $uid): bool {
+        try {
+            $stmt = $pdo->prepare('SELECT role FROM users WHERE id = :id LIMIT 1');
+            $stmt->execute([':id' => $uid]);
+            $r = $stmt->fetch();
+            return ((string) (($r['role'] ?? '') ?: '')) === 'admin';
+        } catch (\Throwable $e) {
+            return false;
+        }
+    };
+
+    $requireContactAccess = static function (PDO $pdo, int $uid, int $contactId) use ($isAdmin): void {
+        if ($contactId <= 0) {
+            json(['error' => 'contact_id required'], 422);
+        }
+        if ($isAdmin($pdo, $uid)) {
+            return;
+        }
+        $chk = $pdo->prepare('SELECT 1
+            FROM contacts ct
+            INNER JOIN conversations c ON c.contact_id = ct.id
+            INNER JOIN user_numbers un ON un.number_id = c.default_number_id
+            WHERE ct.id = :cid AND un.user_id = :uid
+            LIMIT 1');
+        $chk->execute([':cid' => $contactId, ':uid' => $uid]);
+        if (!$chk->fetch()) {
+            json(['error' => 'Forbidden'], 403);
+        }
+    };
+
     if ($uri === '/api/contacts' && $method === 'GET') {
         Auth::requireLogin();
         $pdo = getPdo($rootDir);
         requirePermission($pdo, 'contacts.view');
         $q = trim((string)($_GET['q'] ?? ''));
 
-        $sql = 'SELECT id, first_name, last_name, name, phone_number, email, created_at FROM contacts WHERE 1=1';
+        $uid = Auth::userId();
+        if ($uid === null) {
+            json(['error' => 'Not authenticated'], 401);
+        }
+
+        $sql = 'SELECT ct.id, ct.first_name, ct.last_name, ct.name, ct.phone_number, ct.email, ct.created_at FROM contacts ct WHERE 1=1';
         $params = [];
         if ($q !== '') {
-            $sql .= ' AND (phone_number LIKE :q OR name LIKE :q OR first_name LIKE :q OR last_name LIKE :q OR email LIKE :q)';
+            $sql .= ' AND (ct.phone_number LIKE :q OR ct.name LIKE :q OR ct.first_name LIKE :q OR ct.last_name LIKE :q OR ct.email LIKE :q)';
             $params[':q'] = '%' . $q . '%';
         }
-        $sql .= ' ORDER BY id DESC LIMIT 200';
+
+        if (!$isAdmin($pdo, $uid)) {
+            $sql .= ' AND EXISTS (
+                SELECT 1 FROM conversations c
+                INNER JOIN user_numbers un ON un.number_id = c.default_number_id
+                WHERE c.contact_id = ct.id AND un.user_id = :uid
+            )';
+            $params[':uid'] = $uid;
+        }
+
+        $sql .= ' ORDER BY ct.id DESC LIMIT 200';
 
         $stmt = $pdo->prepare($sql);
         $stmt->execute($params);
@@ -37,13 +82,23 @@ function handleContactsRoutes(string $uri, string $method, string $rootDir): boo
             json(['error' => 'Not authenticated'], 401);
         }
 
-        $sql = 'SELECT id, first_name, last_name, name, phone_number, email, created_at FROM contacts WHERE 1=1';
+        $sql = 'SELECT ct.id, ct.first_name, ct.last_name, ct.name, ct.phone_number, ct.email, ct.created_at FROM contacts ct WHERE 1=1';
         $params = [];
         if ($q !== '') {
-            $sql .= ' AND (phone_number LIKE :q OR name LIKE :q OR first_name LIKE :q OR last_name LIKE :q OR email LIKE :q)';
+            $sql .= ' AND (ct.phone_number LIKE :q OR ct.name LIKE :q OR ct.first_name LIKE :q OR ct.last_name LIKE :q OR ct.email LIKE :q)';
             $params[':q'] = '%' . $q . '%';
         }
-        $sql .= ' ORDER BY id DESC LIMIT 200';
+
+        if (!$isAdmin($pdo, $uid)) {
+            $sql .= ' AND EXISTS (
+                SELECT 1 FROM conversations c
+                INNER JOIN user_numbers un ON un.number_id = c.default_number_id
+                WHERE c.contact_id = ct.id AND un.user_id = :uid
+            )';
+            $params[':uid'] = $uid;
+        }
+
+        $sql .= ' ORDER BY ct.id DESC LIMIT 200';
 
         $stmt = $pdo->prepare($sql);
         $stmt->execute($params);
@@ -281,13 +336,28 @@ function handleContactsRoutes(string $uri, string $method, string $rootDir): boo
         $pdo = getPdo($rootDir);
         $q = trim((string)($_GET['q'] ?? ''));
 
-        $sql = 'SELECT id, first_name, last_name, name, phone_number, email, created_at FROM contacts WHERE 1=1';
+        $uid = Auth::userId();
+        if ($uid === null) {
+            json(['error' => 'Not authenticated'], 401);
+        }
+
+        $sql = 'SELECT ct.id, ct.first_name, ct.last_name, ct.name, ct.phone_number, ct.email, ct.created_at FROM contacts ct WHERE 1=1';
         $params = [];
         if ($q !== '') {
-            $sql .= ' AND (phone_number LIKE :q OR name LIKE :q OR first_name LIKE :q OR last_name LIKE :q OR email LIKE :q)';
+            $sql .= ' AND (ct.phone_number LIKE :q OR ct.name LIKE :q OR ct.first_name LIKE :q OR ct.last_name LIKE :q OR ct.email LIKE :q)';
             $params[':q'] = '%' . $q . '%';
         }
-        $sql .= ' ORDER BY id DESC LIMIT 5000';
+
+        if (!$isAdmin($pdo, $uid)) {
+            $sql .= ' AND EXISTS (
+                SELECT 1 FROM conversations c
+                INNER JOIN user_numbers un ON un.number_id = c.default_number_id
+                WHERE c.contact_id = ct.id AND un.user_id = :uid
+            )';
+            $params[':uid'] = $uid;
+        }
+
+        $sql .= ' ORDER BY ct.id DESC LIMIT 5000';
         $stmt = $pdo->prepare($sql);
         $stmt->execute($params);
         $contacts = $stmt->fetchAll();
@@ -489,6 +559,12 @@ function handleContactsRoutes(string $uri, string $method, string $rootDir): boo
         if ($id <= 0) {
             json(['error' => 'id required'], 422);
         }
+
+        $uid = Auth::userId();
+        if ($uid === null) {
+            json(['error' => 'Not authenticated'], 401);
+        }
+        $requireContactAccess($pdo, $uid, $id);
         if ($name === '' && ($firstName !== '' || $lastName !== '')) {
             $name = trim($firstName . ' ' . $lastName);
         }
@@ -531,6 +607,18 @@ function handleContactsRoutes(string $uri, string $method, string $rootDir): boo
         $contactIds = array_keys($contactIds);
         if (count($contactIds) === 0) {
             json(['error' => 'No valid contact_ids'], 422);
+        }
+
+        if (!$isAdmin($pdo, $uid)) {
+            foreach ($contactIds as $cid) {
+                $requireContactAccess($pdo, $uid, (int) $cid);
+            }
+        }
+
+        if (!$isAdmin($pdo, $uid)) {
+            foreach ($contactIds as $cid) {
+                $requireContactAccess($pdo, $uid, (int) $cid);
+            }
         }
 
         $chk = $pdo->prepare('SELECT id FROM contact_tags WHERE id = :id AND user_id = :uid LIMIT 1');
@@ -612,6 +700,16 @@ function handleContactsRoutes(string $uri, string $method, string $rootDir): boo
         $contactIds = array_keys($contactIds);
         if (count($contactIds) === 0) {
             json(['error' => 'No valid contact_ids'], 422);
+        }
+
+        $uid = Auth::userId();
+        if ($uid === null) {
+            json(['error' => 'Not authenticated'], 401);
+        }
+        if (!$isAdmin($pdo, $uid)) {
+            foreach ($contactIds as $cid) {
+                $requireContactAccess($pdo, $uid, (int) $cid);
+            }
         }
 
         $placeholders = implode(',', array_fill(0, count($contactIds), '?'));
@@ -698,6 +796,12 @@ function handleContactsRoutes(string $uri, string $method, string $rootDir): boo
             json(['error' => 'contact_id required'], 422);
         }
 
+        $uid = Auth::userId();
+        if ($uid === null) {
+            json(['error' => 'Not authenticated'], 401);
+        }
+        $requireContactAccess($pdo, $uid, $contactId);
+
         $stmt = $pdo->prepare('SELECT cf.field_key, cfv.value
         FROM contact_fields cf
         LEFT JOIN contact_field_values cfv ON cfv.field_id = cf.id AND cfv.contact_id = :cid
@@ -730,6 +834,12 @@ function handleContactsRoutes(string $uri, string $method, string $rootDir): boo
         if ($contactId <= 0 || !is_array($values)) {
             json(['error' => 'contact_id and values required'], 422);
         }
+
+        $uid = Auth::userId();
+        if ($uid === null) {
+            json(['error' => 'Not authenticated'], 401);
+        }
+        $requireContactAccess($pdo, $uid, $contactId);
 
         $fields = $pdo->query('SELECT id, field_key FROM contact_fields')->fetchAll();
         $byKey = [];
@@ -779,6 +889,12 @@ function handleContactsRoutes(string $uri, string $method, string $rootDir): boo
         if ($contactId <= 0) {
             json(['error' => 'contact_id required'], 422);
         }
+
+        $uid = Auth::userId();
+        if ($uid === null) {
+            json(['error' => 'Not authenticated'], 401);
+        }
+        $requireContactAccess($pdo, $uid, $contactId);
         $stmt = $pdo->prepare('SELECT cn.id, cn.note, cn.created_at, u.email AS user_email
         FROM contact_notes cn
         INNER JOIN users u ON u.id = cn.user_id
@@ -811,6 +927,8 @@ function handleContactsRoutes(string $uri, string $method, string $rootDir): boo
         if ($uid === null) {
             json(['error' => 'Not authenticated'], 401);
         }
+
+        $requireContactAccess($pdo, $uid, $contactId);
         try {
             $pdo->beginTransaction();
             $pdo->prepare('DELETE FROM contact_notes WHERE contact_id = :cid')

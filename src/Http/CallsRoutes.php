@@ -11,6 +11,21 @@ function handleCallsRoutes(string $uri, string $method, string $rootDir): bool
         $pdo = getPdo($rootDir);
         requirePermission($pdo, 'calls.view');
 
+        $uid = Auth::userId();
+        if ($uid === null) {
+            json(['error' => 'Not authenticated'], 401);
+        }
+
+        $isAdmin = false;
+        try {
+            $r = $pdo->prepare('SELECT role FROM users WHERE id = :id LIMIT 1');
+            $r->execute([':id' => $uid]);
+            $row = $r->fetch();
+            $isAdmin = ((string) (($row['role'] ?? '') ?: '')) === 'admin';
+        } catch (\Throwable $e) {
+            $isAdmin = false;
+        }
+
         $q = trim((string)($_GET['q'] ?? ''));
         $direction = trim((string)($_GET['direction'] ?? ''));
         $status = trim((string)($_GET['status'] ?? ''));
@@ -56,6 +71,22 @@ function handleCallsRoutes(string $uri, string $method, string $rootDir): bool
         if ($toDate !== '' && preg_match('/^\d{4}-\d{2}-\d{2}$/', $toDate)) {
             $where .= ' AND c.created_at <= :todt';
             $params[':todt'] = $toDate . ' 23:59:59';
+        }
+
+        if (!$isAdmin) {
+            $where .= ' AND (
+                EXISTS (
+                    SELECT 1 FROM numbers n
+                    INNER JOIN user_numbers un ON un.number_id = n.id
+                    WHERE un.user_id = :me AND n.phone_number = c.from_number
+                )
+                OR EXISTS (
+                    SELECT 1 FROM numbers n2
+                    INNER JOIN user_numbers un2 ON un2.number_id = n2.id
+                    WHERE un2.user_id = :me AND n2.phone_number = c.to_number
+                )
+            )';
+            $params[':me'] = $uid;
         }
 
         $stmt = $pdo->prepare('SELECT c.*, u.email AS user_email
