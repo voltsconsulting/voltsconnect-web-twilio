@@ -169,6 +169,38 @@ function handleBroadcastRoutes(string $uri, string $method, string $rootDir): bo
                 } catch (\Throwable $e2) {
                 }
             }
+ } elseif ($mode === 'contacts') {
+ $contactIdsRaw = (string) ($payload['contact_ids'] ?? '');
+ $contactIds = [];
+ if ($contactIdsRaw !== '') {
+ $ids = json_decode($contactIdsRaw, true);
+ if (is_array($ids)) {
+ foreach ($ids as $id) {
+ $n = (int) ($id ?? 0);
+ if ($n > 0) { $contactIds[] = $n; }
+ }
+ }
+ }
+ $count = count($contactIds);
+ $optCount = 0;
+ $sample = [];
+ if ($count === 0) {
+ $eligible = 0;
+ } else {
+ $in = implode(',', array_fill(0, $count, '?'));
+ $cntStmt = $pdo->prepare('SELECT COUNT(*) AS c FROM contacts ct WHERE ct.id IN (' . $in . ')');
+ $cntStmt->execute($contactIds);
+ $count = (int) (($cntStmt->fetch()['c'] ?? 0) ?: 0);
+ if ($optEnabled) {
+ $optStmt = $pdo->prepare('SELECT COUNT(DISTINCT ct.id) AS c FROM contacts ct INNER JOIN sms_opt_outs oo ON oo.phone_number = ct.phone_number WHERE ct.id IN (' . $in . ')');
+ $optStmt->execute($contactIds);
+ $optCount = (int) (($optStmt->fetch()['c'] ?? 0) ?: 0);
+ }
+ $eligible = max(0, $count - $optCount);
+ $sampleStmt = $pdo->prepare('SELECT id, first_name, last_name, name, phone_number, email FROM contacts WHERE id IN (' . $in . ') ORDER BY id DESC LIMIT 20');
+ $sampleStmt->execute($contactIds);
+ $sample = $sampleStmt->fetchAll();
+ }
         } elseif ($mode === 'paste') {
             $nums = $sanitizePasteNumbers($numbersRaw);
             if (count($nums) === 0) {
@@ -601,6 +633,38 @@ function handleBroadcastRoutes(string $uri, string $method, string $rootDir): bo
                 $optStmt->execute([':tid' => $tagId]);
                 $optCount = (int) (($optStmt->fetch()['c'] ?? 0) ?: 0);
             }
+ } elseif ($mode === 'contacts') {
+ $contactIdsRaw = (string) ($payload['contact_ids'] ?? '');
+ $contactIds = [];
+ if ($contactIdsRaw !== '') {
+ $ids = json_decode($contactIdsRaw, true);
+ if (is_array($ids)) {
+ foreach ($ids as $id) {
+ $n = (int) ($id ?? 0);
+ if ($n > 0) { $contactIds[] = $n; }
+ }
+ }
+ }
+ $count = count($contactIds);
+ $optCount = 0;
+ $sample = [];
+ if ($count === 0) {
+ $eligible = 0;
+ } else {
+ $in = implode(',', array_fill(0, $count, '?'));
+ $cntStmt = $pdo->prepare('SELECT COUNT(*) AS c FROM contacts ct WHERE ct.id IN (' . $in . ')');
+ $cntStmt->execute($contactIds);
+ $count = (int) (($cntStmt->fetch()['c'] ?? 0) ?: 0);
+ if ($optEnabled) {
+ $optStmt = $pdo->prepare('SELECT COUNT(DISTINCT ct.id) AS c FROM contacts ct INNER JOIN sms_opt_outs oo ON oo.phone_number = ct.phone_number WHERE ct.id IN (' . $in . ')');
+ $optStmt->execute($contactIds);
+ $optCount = (int) (($optStmt->fetch()['c'] ?? 0) ?: 0);
+ }
+ $eligible = max(0, $count - $optCount);
+ $sampleStmt = $pdo->prepare('SELECT id, first_name, last_name, name, phone_number, email FROM contacts WHERE id IN (' . $in . ') ORDER BY id DESC LIMIT 20');
+ $sampleStmt->execute($contactIds);
+ $sample = $sampleStmt->fetchAll();
+ }
         } elseif ($mode === 'paste') {
             $lines = preg_split('/\r\n|\r|\n/', $numbersRaw);
             $nums = [];
@@ -953,6 +1017,38 @@ function handleBroadcastRoutes(string $uri, string $method, string $rootDir): bo
             $sStmt = $pdo->prepare($sql);
             $sStmt->execute($params);
             $sample = $sStmt->fetchAll();
+ } elseif ($mode === 'contacts') {
+ $contactIdsRaw = (string) ($payload['contact_ids'] ?? '');
+ $contactIds = [];
+ if ($contactIdsRaw !== '') {
+ $ids = json_decode($contactIdsRaw, true);
+ if (is_array($ids)) {
+ foreach ($ids as $id) {
+ $n = (int) ($id ?? 0);
+ if ($n > 0) { $contactIds[] = $n; }
+ }
+ }
+ }
+ $count = count($contactIds);
+ $optCount = 0;
+ $sample = [];
+ if ($count === 0) {
+ $eligible = 0;
+ } else {
+ $in = implode(',', array_fill(0, $count, '?'));
+ $cntStmt = $pdo->prepare('SELECT COUNT(*) AS c FROM contacts ct WHERE ct.id IN (' . $in . ')');
+ $cntStmt->execute($contactIds);
+ $count = (int) (($cntStmt->fetch()['c'] ?? 0) ?: 0);
+ if ($optEnabled) {
+ $optStmt = $pdo->prepare('SELECT COUNT(DISTINCT ct.id) AS c FROM contacts ct INNER JOIN sms_opt_outs oo ON oo.phone_number = ct.phone_number WHERE ct.id IN (' . $in . ')');
+ $optStmt->execute($contactIds);
+ $optCount = (int) (($optStmt->fetch()['c'] ?? 0) ?: 0);
+ }
+ $eligible = max(0, $count - $optCount);
+ $sampleStmt = $pdo->prepare('SELECT id, first_name, last_name, name, phone_number, email FROM contacts WHERE id IN (' . $in . ') ORDER BY id DESC LIMIT 20');
+ $sampleStmt->execute($contactIds);
+ $sample = $sampleStmt->fetchAll();
+ }
         } elseif ($mode === 'paste') {
             $lines = preg_split('/\r\n|\r|\n/', $numbersRaw);
             $nums = [];
@@ -1142,6 +1238,38 @@ function handleBroadcastRoutes(string $uri, string $method, string $rootDir): bo
                 $optStmt->execute([':tid' => $tagId]);
                 $optCount = (int) (($optStmt->fetch()['c'] ?? 0) ?: 0);
             }
+ } elseif ($mode === 'contacts') {
+ $contactIdsRaw = (string) ($payload['contact_ids'] ?? '');
+ $contactIds = [];
+ if ($contactIdsRaw !== '') {
+ $ids = json_decode($contactIdsRaw, true);
+ if (is_array($ids)) {
+ foreach ($ids as $id) {
+ $n = (int) ($id ?? 0);
+ if ($n > 0) { $contactIds[] = $n; }
+ }
+ }
+ }
+ $count = count($contactIds);
+ $optCount = 0;
+ $sample = [];
+ if ($count === 0) {
+ $eligible = 0;
+ } else {
+ $in = implode(',', array_fill(0, $count, '?'));
+ $cntStmt = $pdo->prepare('SELECT COUNT(*) AS c FROM contacts ct WHERE ct.id IN (' . $in . ')');
+ $cntStmt->execute($contactIds);
+ $count = (int) (($cntStmt->fetch()['c'] ?? 0) ?: 0);
+ if ($optEnabled) {
+ $optStmt = $pdo->prepare('SELECT COUNT(DISTINCT ct.id) AS c FROM contacts ct INNER JOIN sms_opt_outs oo ON oo.phone_number = ct.phone_number WHERE ct.id IN (' . $in . ')');
+ $optStmt->execute($contactIds);
+ $optCount = (int) (($optStmt->fetch()['c'] ?? 0) ?: 0);
+ }
+ $eligible = max(0, $count - $optCount);
+ $sampleStmt = $pdo->prepare('SELECT id, first_name, last_name, name, phone_number, email FROM contacts WHERE id IN (' . $in . ') ORDER BY id DESC LIMIT 20');
+ $sampleStmt->execute($contactIds);
+ $sample = $sampleStmt->fetchAll();
+ }
         } elseif ($mode === 'paste') {
             $lines = preg_split('/\r\n|\r|\n/', $numbersRaw);
             $nums = [];

@@ -3079,7 +3079,7 @@ $content .= '<input class="input" id="globalSearchInput" placeholder="Search" st
         . '<option value="search">Search filter</option>'
         . '<option value="group">Group</option>'
         . '<option value="tag">Tag</option>'
-        . '<option value="paste">Paste numbers</option>'
+        . '<option value="paste">Paste numbers</option><option value="contacts">Selected contacts (0)</option>'
         . '</select>';
     $content .= '<div id="broadcastAudienceSearch" style="margin-top:10px;display:none">';
     $content .= '<input class="input" id="broadcastQuery" placeholder="Search filter (name, number, email)" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false">';

@@ -2005,11 +2005,16 @@ function wireBroadcast() {
     if (boxGroup) boxGroup.style.display = v === 'group' ? '' : 'none';
     if (boxTag) boxTag.style.display = v === 'tag' ? '' : 'none';
     if (boxPaste) boxPaste.style.display = v === 'paste' ? '' : 'none';
+ const selOpt=mode ? mode.querySelector('option[value="contacts"]') : null;
+ if (selOpt) {
+ const cnt=getSelectedContactIds().length;
+ selOpt.textContent='Selected contacts ('+cnt+')';
+ }
+ if (boxSearch) boxSearch.style.display = '';
+ if (boxGroup) boxGroup.style.display = '';
+ if (boxTag) boxTag.style.display = '';
+ if (boxPaste) boxPaste.style.display = '';
   };
-  if (mode) {
-    mode.addEventListener('change', applyMode);
-    applyMode();
-  }
 
   const tplSel = el('broadcastTemplate');
   if (tplSel) {
@@ -2096,13 +2101,14 @@ function wireBroadcast() {
   if (previewBtn) {
     previewBtn.addEventListener('click', async () => {
       const modeV = String(el('broadcastAudienceMode') ? el('broadcastAudienceMode').value : 'all');
+ if (modeV==='contacts' && getSelectedContactIds().length===0) { toastError('Select contacts in the Contacts view first'); return; }
       const q = String(el('broadcastQuery') ? el('broadcastQuery').value : '').trim();
       const groupId = Number(el('broadcastGroupSelect') ? el('broadcastGroupSelect').value : 0) || 0;
       const tagId = Number(el('broadcastTagSelect') ? el('broadcastTagSelect').value : 0) || 0;
       const numbers = String(el('broadcastPasteNumbers') ? el('broadcastPasteNumbers').value : '');
       try {
         previewBtn.disabled = true;
-        const data = await apiPost('/api/broadcast/preview', { mode: modeV, q, group_id: groupId, tag_id: tagId, numbers });
+ const data = await apiPost('/api/broadcast/preview', { mode: modeV, q, group_id: groupId, tag_id: tagId, numbers, contact_ids: (modeV==='contacts' ? getSelectedContactIds() : []) });
         const host = el('broadcastPreview');
         if (host) {
           const s = Array.isArray(data.sample) ? data.sample : [];
@@ -2147,7 +2153,7 @@ function wireBroadcast() {
         const numbers = String(el('broadcastPasteNumbers') ? el('broadcastPasteNumbers').value : '');
         try {
           sendBtn.disabled = true;
-          const payload = { mode: modeV, q, group_id: groupId, tag_id: tagId, numbers, body: bodyText, from_number_id: fromNumberId, schedule_date: d, schedule_time: t };
+ const payload = { mode: modeV, q, group_id: groupId, tag_id: tagId, numbers, body: bodyText, from_number_id: fromNumberId, schedule_date: d, schedule_time: t, contact_ids: (modeV==='contacts' ? getSelectedContactIds() : []) };
           if (throttlingOn) {
             payload.batch_size = batchSize;
             payload.send_delay_ms = sendDelayMs;
@@ -2174,7 +2180,7 @@ function wireBroadcast() {
       const numbers = String(el('broadcastPasteNumbers') ? el('broadcastPasteNumbers').value : '');
       try {
         sendBtn.disabled = true;
-        const payload = { mode: modeV, q, group_id: groupId, tag_id: tagId, numbers, body: bodyText, from_number_id: fromNumberId, dry_run: false };
+ const payload = { mode: modeV, q, group_id: groupId, tag_id: tagId, numbers, body: bodyText, from_number_id: fromNumberId, dry_run: false, contact_ids: (modeV==='contacts' ? getSelectedContactIds() : []) };
         if (throttlingOn) {
           payload.batch_size = batchSize;
           payload.send_delay_ms = sendDelayMs;
@@ -3743,7 +3749,7 @@ function renderCalls() {
       if (m && m[1]) sid = String(m[1]);
     }
     const proxied = sid ? `/api/voice/recording?sid=${encodeURIComponent(sid)}` : '';
-    const recLink = proxied ? `<a class="btn" href="${escapeHtml(proxied)}" target="_blank">Recording</a>` : '';
+ const recLink = proxied ? `<audio src="${escapeHtml(proxied)}" controls style="width:100%;max-width:300px;margin-top:6px;height:36px"></audio>` : '';
     const selected = !!(state.selectedCallIds && state.selectedCallIds[id]);
     return `<div class="item" data-cid="${id}">
       <div class="row" style="align-items:center;justify-content:space-between;gap:10px">
