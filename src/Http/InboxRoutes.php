@@ -542,6 +542,7 @@ function handleInboxRoutes(string $uri, string $method, string $rootDir): bool
         }
         $requireConversationAccess($pdo, $uid, $conversationId);
 
+ requireRateLimit($pdo, $uid, 'send_sms', 30, 60);
         $convStmt = $pdo->prepare('SELECT c.id, c.contact_id, ct.phone_number AS to_number, c.default_number_id, n.phone_number AS default_from
         FROM conversations c
         INNER JOIN contacts ct ON ct.id = c.contact_id

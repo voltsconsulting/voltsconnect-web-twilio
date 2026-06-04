@@ -187,6 +187,53 @@ This is a multi-user PHP web CRM + Twilio communications hub (SMS, MMS, browser 
 
 ---
 
+---
+
+## High Priority Items (2026-06-03)
+
+### #3 — Calls filter auto-apply (10 min)
+
+**Backend**: No changes needed — `/api/calls` already supports all filter params.
+
+**Frontend** (`public/app.js` wireCalls function):
+- Add `input`/`change` event listeners on all 6 filter inputs
+- Debounce 400ms then call `loadCalls()` on change
+- Reset button clears all inputs then reloads
+
+---
+
+### #4 — SMS delivery status badges (20 min)
+
+**Backend**: Already done — Twilio webhook at `/webhooks/twilio/sms/status` updates `messages.status`.
+
+**Frontend** (`public/app.js` renderMessages + `public/styles.css`):
+- Add CSS: `.smsStatus.sent` (blue), `.smsStatus.delivered` (green), `.smsStatus.queued` (amber), `.smsStatus.failed` (red)
+- Update `renderMessages()`: show badge on outbound messages only
+- Map raw Twilio statuses: `sent`→"Sent" (blue), `delivered`→"Delivered" (green), `queued`→"Queued" (amber), `failed`→"Failed" (red), `undelivered`→"Undelivered" (red)
+
+---
+
+### #11 — Rate limiting on API (45 min)
+
+**DB table**:
+```sql
+CREATE TABLE rate_limits (
+ id INT AUTO_INCREMENT PRIMARY KEY,
+ user_id INT NOT NULL,
+ endpoint VARCHAR(100) NOT NULL,
+ request_count INT NOT NULL DEFAULT 1,
+ window_start DATETIME NOT NULL,
+ UNIQUE KEY (user_id, endpoint)
+);
+```
+
+**New file**: `src/Http/RateLimitRoutes.php`
+- `checkRateLimit(PDO $pdo, int $uid, string $endpoint, int $limit, int $windowSecs)` function
+- Fixed-window algorithm: reset count when window expires, block + return retry_after when over limit
+- Wrapped `InboxRoutes::sendMessage()` call in rate check — 30 SMS/min per user
+
+---
+
 ## Out of Scope (For Now)
 
 - Mobile app / PWA

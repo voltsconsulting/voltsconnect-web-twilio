@@ -2375,7 +2375,8 @@ if ($uri === '/app' && $method === 'GET') {
     $content .= '<div class="topActions">';
     $content .= '<button class="btn" type="button" id="navHamburger">Menu</button>';
     $content .= '<button class="btn" type="button" id="themeToggle"><span id="themeToggleIcon" aria-hidden="true"></span><span id="themeToggleLabel">Theme</span></button>';
-    $content .= '<form method="post" action="/logout" style="margin:0"><button class="btn danger" type="submit">Logout</button></form>';
+$content .= '<input class="input" id="globalSearchInput" placeholder="Search" style="max-width:160px;font-size:13px;padding:6px 10px" autocomplete="off">';
+     $content .= '<form method="post" action="/logout" style="margin:0"><button class="btn danger" type="submit">Logout</button></form>';
     $content .= '</div>';
     $content .= '</header>';
 

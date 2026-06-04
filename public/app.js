@@ -2979,6 +2979,7 @@ async function apiPost(url, payload) {
   return await res.json();
 }
 
+
 function themeApply(theme) {
   const root = document.documentElement;
   if (theme === 'light') {
@@ -3207,6 +3208,8 @@ async function setActiveNav(view) {
     loadCrmLists().then(() => {
       refreshCrmDropdowns();
       loadContacts().catch(() => {});
+ const loadMoreBtn = el('contactsLoadMore');
+ if (loadMoreBtn) { loadMoreBtn.addEventListener('click', () => { loadContacts({ loadMore: true }).catch(() => {}); }); }
     }).catch(() => loadContacts().catch(() => {}));
   }
   if (view === 'users') {
@@ -3264,6 +3267,15 @@ async function setActiveNav(view) {
     loadVoicemails().catch(() => {});
     try { wireVoicemails(); } catch {}
   }
+}
+
+function searchGlobal(term) {
+ if (!term || term.length < 2) { showToast('Enter at least 2 characters', 'info'); return; }
+ apiGet(`/api/contacts/full?q=${encodeURIComponent(term)}&limit=20`).then(function(data){
+ var html = (data.contacts || []).map(function(c){ var n=c.display_name||c.phone||c.id; return '<div class="item" onclick="openInboxFor('+c.id+')" style="cursor:pointer;padding:10px">'+n+'</div>'; }).join('');
+ if (!html) html='<div style="padding:12px">No contacts found</div>';
+ var panel=el('globalSearchResults'); if(panel){ panel.innerHTML=html; panel.style.display='block'; }
+ }).catch(function(){});
 }
 
 function wireNavigation() {
@@ -3469,18 +3481,24 @@ function renderContacts() {
   updateContactsBulkBar();
 }
 
-async function loadContacts() {
-  const qEl = el('contactsSearch');
-  const q = qEl ? String(qEl.value || '').trim() : '';
-  const data = await apiGet(`/api/contacts/full?q=${encodeURIComponent(q)}`);
-  state.contacts = data.contacts || [];
-  state.contactFields = data.fields || [];
-  state.contactsFieldValues = data.values_by_contact || {};
-  state.contactsTagsByContact = data.tags_by_contact || {};
-  state.contactsGroupsByContact = data.groups_by_contact || {};
-  renderContacts();
+async function loadContacts(opts = {}) {
+ const qEl = el('contactsSearch');
+ const q = qEl ? String(qEl.value || '').trim() : '';
+ const limit = 50;
+ const offset = opts.loadMore ? (state._contactsOffset || 0) : 0;
+ const data = await apiGet(`/api/contacts/full?q=${encodeURIComponent(q)}&limit=${limit}&offset=${offset}`);
+ const newContacts = data.contacts || [];
+ if (opts.loadMore) { state.contacts = (state.contacts || []).concat(newContacts); } else { state.contacts = newContacts; }
+ state._contactsOffset = offset + newContacts.length;
+ state._contactsHasMore = (state._contactsOffset || 0) < (data.total || 0);
+ state.contactFields = data.fields || [];
+ state.contactsFieldValues = data.values_by_contact || {};
+ state.contactsTagsByContact = data.tags_by_contact || {};
+ state.contactsGroupsByContact = data.groups_by_contact || {};
+ renderContacts();
+ const loadMoreBtn = el('contactsLoadMore');
+ if (loadMoreBtn) { loadMoreBtn.style.display = state._contactsHasMore ? 'block' : 'none'; }
 }
-
 function wireContacts() {
   const qEl = el('contactsSearch');
   if (qEl) {
@@ -3807,6 +3825,9 @@ function wireCalls() {
       loadCalls().catch(() => {});
     });
   }
+
+ const autoApplyFn = (id) => { const e=el(id); if(e) e.addEventListener('change', ()=>loadCalls().catch(()=>{})); }; autoApplyFn('callsDirection'); autoApplyFn('callsStatus'); autoApplyFn('callsUser');
+ const autoDebounce = (id) => { const e=el(id); if(e){ let t; e.addEventListener('input',()=>{clearTimeout(t);t=setTimeout(()=>loadCalls().catch(()=>{}),500);});} }; autoDebounce('callsSearch'); autoDebounce('callsFromDate'); autoDebounce('callsToDate');
 
   const selAll = el('callsSelectAllVisible');
   if (selAll) {
@@ -4618,7 +4639,7 @@ function renderMessages(messages) {
       const isPdf = ct === 'application/pdf' || /\.(pdf)(\?|#|$)/i.test(url);
 
       if (isImg) {
-        return `<a href="${u}" target="_blank" rel="noopener noreferrer" class="mediaBox"><img src="${u}" alt="attachment" loading="lazy"></a>`;
+        return `<a href="${u}" onclick="event.preventDefault();openMmsLightbox(this.href)"  class="mediaBox"><img src="${u}" alt="attachment" loading="lazy"></a>`;
       }
       if (isVid) {
         return `<div class="mediaBox"><video src="${u}" controls></video></div>`;
@@ -4640,10 +4661,16 @@ function renderMessages(messages) {
     const dir = isOut ? 'out' : 'in';
     const body = escapeHtml(m.body || '');
     const toNumber = escapeHtml(m.to_number || '');
-    const metaParts = [`${fmtWhen(m.created_at)}`, (m.status || '')].filter(Boolean);
-    if (!isOut && toNumber) {
-      metaParts.push(`to ${toNumber}`);
-    }
+var rawStatus = String(m.status || '');
+ var statusLabel = rawStatus ? {sent:'Sent',delivered:'Delivered',queued:'Queued',sending:'Sending',failed:'Failed',undelivered:'Undelivered'}[rawStatus] || rawStatus : '';
+ var statusBadge = '';
+ if (isOut && rawStatus) {
+ var cls = rawStatus;
+ statusBadge = '<span class="smsStatus ' + cls + '">' + statusLabel + '</span>';
+ }
+ var metaParts = [`${fmtWhen(m.created_at)}`];
+ if (statusBadge) metaParts.push(statusBadge);
+ if (!isOut && toNumber) metaParts.push(`to ${toNumber}`);
     const meta = escapeHtml(metaParts.join(' • '));
 
     const mediaHtml = renderMedia(m.media, Number(m.id || 0));
@@ -5259,6 +5286,23 @@ function ensureTwilioSdk() {
   });
 }
 
+function openMmsLightbox(src) {
+ var overlay = el('mmsLightbox'); var img = el('mmsLightboxImg');
+ if (!overlay || !img) return;
+ img.src = src; overlay.style.display = 'flex';
+}
+function closeMmsLightbox() {
+ var overlay = el('mmsLightbox');
+ if (overlay) overlay.style.display = 'none';
+}
+
+function viewConversationWithMobile() {
+ var sb = el('sidebar'); var ov = el('mobileSidebarOverlay');
+ if (!sb) return;
+ if (sb.classList.contains('mobileHidden')) { sb.classList.remove('mobileHidden'); if (ov) ov.classList.remove('hidden'); }
+ else { sb.classList.add('mobileHidden'); if (ov) ov.classList.add('hidden'); }
+}
+
 function startPolling() {
   if (state.polling) clearInterval(state.polling);
   state.polling = setInterval(() => {
@@ -5306,6 +5350,14 @@ window.addEventListener('load', async () => {
     safeCall(syncNotifRuleEditor);
   }
 
+ const sEl=el('globalSearchInput');
+ if(sEl){sEl.addEventListener('keydown',function(e){
+ if(e.key==='Enter'){searchGlobal(this.value);this.value='';}
+ if(e.key==='Escape'){this.value='';var p=el('globalSearchResults');if(p)p.style.display='none';}
+});sEl.addEventListener('blur',function(){
+ setTimeout(function(){var p=el('globalSearchResults');if(p)p.style.display='none';},300);
+});}
+
   safeCall(wireNavigation);
   safeCall(wireMobileNavDrawer);
   safeCall(wireAnalytics);
@@ -5317,7 +5369,16 @@ window.addEventListener('load', async () => {
   safeCall(wireSettingsTabs);
   safeCall(wireTimezoneSettings);
   safeCall(wireOptOutSettings);
-  safeCall(() => { if (typeof wireCustomFieldsSettings === 'function') wireCustomFieldsSettings(); });
+safeCall(() => {
+ loadUsersAndNumbers().then(() => {
+ renderDialFromNumbers();
+ initVoice().catch(() => {});
+ }).catch(() => { initVoice().catch(() => {}); });
+ loadConversations().catch(() => {});
+ setInterval(() => {
+ if (typeof device !== 'undefined' && device) { initVoice().catch(() => {}); }
+ }, 240000);
+ });
   safeCall(wireInboxTemplatesAndMms);
   safeCall(wireInboxControls);
   safeCall(wireRightPanelActions);
